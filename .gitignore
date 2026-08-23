@@ -1,0 +1,9 @@
+node_modules/
+.openclaw-state/
+.runtime/
+.venv-xspace/
+__pycache__/
+*.pyc
+data/
+.env
+npm-debug.log*
