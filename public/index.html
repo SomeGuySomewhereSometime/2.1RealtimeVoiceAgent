@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="pt-PT">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0a0d14">
+    <title>Codex 2.1 — Realtime Voice</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body data-state="idle">
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div><p class="eyebrow">REALTIME 2.1 · CODEX APP-SERVER</p><h1>Codex 2.1 Voice</h1></div>
+        </div>
+        <p class="status-chip"><span></span><strong id="status">Pronto</strong></p>
+      </header>
+
+      <section class="hero" aria-labelledby="state-title">
+        <div class="orb-wrap" aria-hidden="true">
+          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+          <div class="orb"><div class="wave"><i></i><i></i><i></i><i></i><i></i></div></div>
+        </div>
+        <p class="state-kicker" id="state-kicker">SESSÃO LOCAL</p>
+        <h2 id="state-title">Voz em tempo real,<br>com cérebro Codex.</h2>
+        <p id="detail">Sem API key: Realtime por OpenClaw e Codex persistente no servidor local.</p>
+
+        <div class="controls">
+          <label class="voice-control">Voz
+            <select id="voice">
+              <option value="marin">Marin</option><option value="cedar">Cedar</option>
+              <option value="coral">Coral</option><option value="sage">Sage</option>
+              <option value="verse">Verse</option><option value="alloy">Alloy</option>
+              <option value="ash">Ash</option><option value="ballad">Ballad</option>
+              <option value="echo">Echo</option><option value="shimmer">Shimmer</option>
+            </select>
+          </label>
+          <label class="voice-control">Reasoning
+            <select id="reasoning">
+              <option value="low">Baixo · mais rápido</option>
+              <option value="medium">Médio</option>
+              <option value="high">Alto · mais ponderado</option>
+            </select>
+          </label>
+          <label class="voice-control">Entrada
+            <select id="audio-input" aria-label="Microfone de entrada">
+              <option value="">Microfone do sistema</option>
+            </select>
+          </label>
+          <label class="voice-control">Saída
+            <select id="audio-output" aria-label="Saída de áudio">
+              <option value="">Saída do sistema</option>
+            </select>
+          </label>
+          <button id="start" class="button primary" type="button">Iniciar conversa</button>
+          <button id="mute" class="button" type="button" disabled>Silenciar</button>
+          <button id="end" class="button danger" type="button" disabled>Terminar</button>
+        </div>
+        <p class="backend-note"><span aria-hidden="true"></span> <span id="audio-device-note">A carregar dispositivos de áudio…</span></p>
+      </section>
+
+      <section class="xspace-panel" aria-labelledby="xspace-title">
+        <div class="xspace-config">
+          <div>
+            <p class="eyebrow">CONTEXTO DO X SPACE</p>
+            <h3 id="xspace-title">Quem disse o quê</h3>
+            <p id="xspace-status" class="xspace-status" data-state="disabled">Sem X Space ligado.</p>
+          </div>
+          <form id="xspace-form">
+            <input id="xspace-input" type="text" maxlength="300" autocomplete="off" placeholder="Link ou ID do X Space" aria-label="Link ou identificador do X Space">
+            <button id="xspace-connect" class="button" type="submit">Ligar</button>
+          </form>
+        </div>
+        <p class="xspace-hint">O X decide quando uma legenda está final. Cada segmento chega logo ao Live como contexto silencioso <code>@handle + texto</code>; não há comparação de tempos nem resposta automática.</p>
+        <div id="xspace-feed" class="xspace-feed" aria-live="polite">
+          <p class="empty">As legendas finais dos participantes aparecem aqui.</p>
+        </div>
+      </section>
+
+      <div class="workspace-grid">
+        <section class="transcript-panel" aria-labelledby="transcript-title">
+          <div class="panel-header">
+            <div><p class="eyebrow">TRANSCRIÇÃO</p><h3 id="transcript-title">Conversa atual</h3></div>
+            <button id="clear" class="text-button" type="button">Limpar</button>
+          </div>
+          <div id="messages" class="messages" aria-live="polite">
+            <p class="empty" id="empty">A transcrição aparece aqui quando começares a falar.</p>
+          </div>
+          <form id="composer">
+            <textarea id="prompt" rows="2" maxlength="4000" placeholder="Também podes escrever uma mensagem…" disabled></textarea>
+            <button id="send" class="button primary" type="submit" disabled>Enviar</button>
+          </form>
+        </section>
+
+        <aside class="evaluation-panel" aria-labelledby="evaluation-title">
+          <div class="panel-header">
+            <div><p class="eyebrow">AVALIAÇÃO PERSISTENTE</p><h3 id="evaluation-title">Luna → Live</h3></div>
+            <button id="refresh-evaluation" class="text-button" type="button">Atualizar</button>
+          </div>
+          <p class="evaluation-hint">Pedidos ao Luna, tempo de espera, resposta interna e resposta final dita pelo Live.</p>
+          <div id="evaluation-feed" class="evaluation-feed" aria-live="polite">
+            <p class="empty" id="evaluation-empty">Ainda não houve pedidos ao Luna.</p>
+          </div>
+        </aside>
+      </div>
+
+      <footer><span>OpenClaw Quicksilver + Codex app-server</span><span>gpt-realtime-2.1 · gpt-5.6-luna low</span></footer>
+    </main>
+    <audio id="remote-audio" autoplay></audio>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
