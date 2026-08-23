@@ -1,4 +1,4 @@
-# Codex 2.1 Voice — Realtime + cérebro Codex persistente
+# Mira — Realtime 2.1 + cérebro Codex persistente
 
 Aplicação local speech-to-speech inspirada nos projetos `2.5LiveVoiceAgent` e
 `3.1LiveVoiceAgent`, mas usando o modelo **`gpt-realtime-2.1`** por WebRTC.
@@ -24,7 +24,7 @@ browser (microfone + áudio remoto)
                                                 └── fork efémero de pesquisa web
 ```
 
-O `gpt-realtime-2.1` continua responsável pela conversa de baixa latência. Quando
+Mira usa o `gpt-realtime-2.1` para a conversa de baixa latência. Quando
 precisa de melhor lógica, memória, informação atual, ficheiros ou planeamento,
 chama `consult_codex`. Todas essas consultas, incluindo pesquisa web, usam
 explicitamente **`gpt-5.6-luna`** com reasoning **`low`**. O browser nunca recebe
@@ -38,6 +38,9 @@ o login nem o protocolo interno do Codex.
   sem fixar uma língua;
 - usa `semantic_vad` com eagerness `medium` para tolerar hesitações e pausas curtas,
   mantendo a interrupção automática quando o utilizador volta a falar;
+- decide silenciosamente, através de uma resposta textual out-of-band do próprio
+  `gpt-realtime-2.1`, se cada turno de voz é dirigido à Mira; decisões ambíguas,
+  inválidas ou com erro resultam em silêncio;
 - aceita mensagens escritas durante a sessão;
 - permite escolher reasoning baixo, médio ou alto antes de iniciar;
 - permite escolher o microfone antes de iniciar e mudar a saída de áudio durante
@@ -51,6 +54,8 @@ o login nem o protocolo interno do Codex.
   relevantes e perguntas com “hoje”, “atual”, “último” ou “mais recente”;
 - mantém o microfone e a interface ativos enquanto uma consulta está pendente;
 - guarda a conversa literal em `data/conversation.jsonl`;
+- guarda decisões `RESPOND`/`IGNORE`, latência e, quando disponível, a transcrição
+  associada em `data/response-gates.jsonl`, sem guardar áudio;
 - guarda todos os pedidos e respostas do Luna, com duração, modelo, reasoning e
   prompt técnico, em `data/codex-consults.jsonl`;
 - executa pesquisa num fork efémero, guarda o resultado em `data/research.jsonl`
@@ -130,7 +135,8 @@ conversa**. Na primeira utilização, autorize o microfone. `PORT`, `HOST`,
 npm run check
 ```
 
-Os testes verificam a fronteira HTTP local, as escolhas fixas de
+Os testes verificam a fronteira HTTP local, o response gate e a sua máquina de
+estados, as escolhas fixas de
 `gpt-realtime-2.1` e `gpt-5.6-luna`/`low`, a ferramenta permitida, as vozes, o
 isolamento do token OAuth, o diário JSONL, a thread durável e o fork de pesquisa.
 A prova final do áudio continua a ser uma chamada real, porque o acesso Realtime
