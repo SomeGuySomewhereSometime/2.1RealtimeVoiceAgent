@@ -86,6 +86,22 @@ test("o diário JSONL mantém sequência e proveniência", () => {
     assert.equal(reloaded.readConsults()[0].model, "gpt-5.6-luna");
     assert.equal(reloaded.readConsults()[0].reasoningEffort, "low");
     assert.equal(reloaded.readConsults()[0].durationMs, 1234);
+    const gate = reloaded.appendResponseGate({
+      at: "2026-08-23T10:00:02.000Z",
+      decision: "RESPOND",
+      latencyMs: 183,
+      speaker: "@pessoa",
+      text: "Mira, o que achas?",
+    });
+    assert.deepEqual(gate, {
+      at: "2026-08-23T10:00:02.000Z",
+      decision: "RESPOND",
+      latencyMs: 183,
+      speaker: "@pessoa",
+      text: "Mira, o que achas?",
+    });
+    assert.deepEqual(reloaded.readResponseGates(), [gate]);
+    assert.throws(() => reloaded.appendResponseGate({ decision: "MAYBE", latencyMs: 1 }));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

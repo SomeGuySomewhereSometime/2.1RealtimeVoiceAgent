@@ -24,7 +24,7 @@ const CODEX_TURN_OPTIONS = Object.freeze({
 });
 
 export const CODEX_BACKEND_INSTRUCTIONS = `
-És o cérebro Codex persistente de um agente de voz chamado Codex 2.1.
+És o cérebro Codex persistente de um agente de voz chamado Mira.
 O gpt-realtime-2.1 trata do áudio e da expressão verbal; tu forneces análise, continuidade, memória contextual, pesquisa e leitura de ficheiros.
 Responde na língua do PEDIDO ATUAL, de forma compacta e diretamente utilizável pelo modelo de voz. Não fixes a resposta a português.
 Preserva nuances, correções, preferências, referentes e assuntos pendentes da conversa.
@@ -91,6 +91,7 @@ export class ConversationJournal {
   #path;
   #researchPath;
   #consultPath;
+  #responseGatePath;
   #nextSeq = 1;
   #nextConsultSeq = 1;
 
@@ -100,6 +101,7 @@ export class ConversationJournal {
     this.#path = resolve(root, "conversation.jsonl");
     this.#researchPath = resolve(root, "research.jsonl");
     this.#consultPath = resolve(root, "codex-consults.jsonl");
+    this.#responseGatePath = resolve(root, "response-gates.jsonl");
     const rows = this.readAll();
     const last = rows.at(-1);
     if (Number.isInteger(last?.seq) && last.seq > 0) this.#nextSeq = last.seq + 1;
@@ -172,6 +174,23 @@ export class ConversationJournal {
     return row;
   }
 
+  appendResponseGate({ at, decision, latencyMs, speaker = "", text = "", error = "" }) {
+    if (decision !== "RESPOND" && decision !== "IGNORE") {
+      throw new Error("Decisão do response gate inválida.");
+    }
+    const suppliedAt = new Date(String(at || ""));
+    const row = {
+      at: Number.isNaN(suppliedAt.getTime()) ? new Date().toISOString() : suppliedAt.toISOString(),
+      decision,
+      latencyMs: Math.max(0, Math.min(60_000, Math.round(Number(latencyMs) || 0))),
+      ...(String(speaker || "").trim() ? { speaker: String(speaker).trim().slice(0, 180) } : {}),
+      ...(String(text || "").trim() ? { text: String(text).trim().slice(0, 12_000) } : {}),
+      ...(String(error || "").trim() ? { error: String(error).trim().slice(0, 500) } : {}),
+    };
+    appendFileSync(this.#responseGatePath, `${JSON.stringify(row)}\n`, { mode: 0o600 });
+    return row;
+  }
+
   readAll() {
     if (!existsSync(this.#path)) return [];
     return readFileSync(this.#path, "utf8")
@@ -191,6 +210,18 @@ export class ConversationJournal {
         try { return [JSON.parse(line)]; } catch { return []; }
       });
     const count = Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.round(limit))) : rows.length;
+    return rows.slice(-count);
+  }
+
+  readResponseGates(limit = Number.POSITIVE_INFINITY) {
+    if (!existsSync(this.#responseGatePath)) return [];
+    const rows = readFileSync(this.#responseGatePath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      });
+    const count = Number.isFinite(limit) ? Math.max(1, Math.min(500, Math.round(limit))) : rows.length;
     return rows.slice(-count);
   }
 
@@ -267,7 +298,7 @@ export class CodexAppServerClient {
       if (!this.#closed) this.#failAll(new Error(`O Codex app-server terminou (${signal || code || "sem detalhe"}).`));
     });
     await this.#requestRaw("initialize", {
-      clientInfo: { name: "codex_realtime_21_voice", title: "Codex 2.1 Voice", version: "0.2.0" },
+      clientInfo: { name: "codex_realtime_21_voice", title: "Mira Realtime Voice", version: "0.2.0" },
       capabilities: { experimentalApi: true },
     });
     this.notify("initialized", {});
