@@ -120,7 +120,7 @@ Preencha apenas localmente:
 
 ```text
 ZEP_API_KEY=...
-ZEP_USER_ID=owner-main
+ZEP_USER_ID=mira-main
 ZEP_OWNER_NAME=Owner
 ZEP_ENABLED=true
 ZEP_CONTEXT_TIMEOUT_MS=350
