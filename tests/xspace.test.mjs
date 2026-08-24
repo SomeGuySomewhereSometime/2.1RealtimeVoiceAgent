@@ -6,6 +6,8 @@ import {
   buildXSpaceContext,
   normalizeXSpaceRoomId,
   parseXSpaceCaption,
+  resolveXSpaceConfig,
+  shouldForwardXSpaceCaption,
 } from "../xspace-source.mjs";
 
 test("normaliza links x.com e IDs de X Spaces", () => {
@@ -35,6 +37,16 @@ test("aceita apenas legendas com handle, texto final já filtrado e identidade v
   });
   assert.equal(parseXSpaceCaption({ eventId: "x", text: "sem autor", receivedAtMs: 1 }).handle, "");
   assert.equal(parseXSpaceCaption({ eventId: "x", handle: "autor", text: "", receivedAtMs: 1 }), null);
+});
+
+test("a própria Mira é journaled mas nunca reenviada como participante externo", () => {
+  const config = resolveXSpaceConfig({}, "/tmp/mira-xspace-test");
+  assert.equal(config.selfHandle, "mira_theagent");
+  assert.equal(shouldForwardXSpaceCaption({ handle: "@MIRA_THEAGENT" }, config.selfHandle), false);
+  assert.equal(shouldForwardXSpaceCaption({ handle: "someguy_112358" }, config.selfHandle), true);
+
+  const source = readFileSync(new URL("../xspace-source.mjs", import.meta.url), "utf8");
+  assert.ok(source.indexOf("this.#journal(caption)") < source.indexOf("if (shouldForwardXSpaceCaption(caption"));
 });
 
 test("preserva IDs estruturados e aceita atribuição unknown sem adivinhar display name", () => {
