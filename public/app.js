@@ -1,4 +1,5 @@
 import { MiraResponseGate } from "./response-gate.js";
+import { RealtimeZepContext } from "./zep-context.js";
 
 const $ = (selector) => document.querySelector(selector);
 const startButton = $("#start");
@@ -92,6 +93,10 @@ let queuedResponse = false;
 let voiceInputActive = false;
 let pendingLiveConsultId = "";
 let xSpaceEvents;
+let xSpaceRoomId = "";
+let memorySessionId = "";
+let zepContextWaitMs = 650;
+let latestGateId = "";
 let evaluationSnapshot = { conversation: [], consults: [] };
 const drafts = new Map();
 const toolDrafts = new Map();
@@ -99,17 +104,11 @@ const activeToolCalls = new Map();
 const handledToolCalls = new Set();
 const recentFinals = new Map();
 const transientEvaluations = new Map();
+const pendingZepTurns = new Map();
+const realtimeZepContext = new RealtimeZepContext({ send: (event) => sendRealtime(event) });
 const responseGate = new MiraResponseGate({
   send: (event) => sendRealtime(event),
-  onDecision: (result) => {
-    if (result.decision === "RESPOND") {
-      queuedResponse = true;
-      setState("thinking", "A responder", "A fala foi dirigida à Mira.");
-    } else {
-      setState("listening", "A ouvir", "A Mira mantém-se em silêncio.");
-    }
-    maybeCreateResponse();
-  },
+  onDecision: (result) => { void handleGateDecision(result); },
   onLog: (result) => recordResponseGate(result),
 });
 
@@ -165,6 +164,7 @@ async function connect() {
     if (!runtime.oauthConfigured) {
       throw new Error("OAuth ChatGPT do OpenClaw em falta. No terminal, executa `npm run auth` uma vez.");
     }
+    zepContextWaitMs = Math.max(250, Number(runtime.zep?.contextTimeoutMs) + 300 || 650);
 
     microphone = await acquireInputStream();
     await refreshAudioDevices();
@@ -176,6 +176,7 @@ async function connect() {
     const session = await sessionResponse.json();
     if (!sessionResponse.ok) throw new Error(session.error || "O broker não criou a sessão Realtime.");
     clientSecret = session.clientSecret;
+    memorySessionId = String(session.memorySessionId || `local-${crypto.randomUUID()}`);
 
     peer = new RTCPeerConnection();
     for (const track of microphone.getTracks()) peer.addTrack(track, microphone);
@@ -378,6 +379,7 @@ async function configureXSpace(event) {
 
 function renderXSpaceStatus(value) {
   const state = String(value?.state || "disabled");
+  xSpaceRoomId = state === "disabled" ? "" : String(value?.roomId || "");
   xSpaceStatus.dataset.state = state;
   if (value?.roomId && !xSpaceInput.value.trim()) xSpaceInput.value = value.roomId;
   if (state === "connected") {
@@ -441,12 +443,14 @@ function handleRealtimeEvent(raw) {
     && responseGate.handleTextEvent(event)) return;
   if (type === "input_audio_buffer.speech_started") {
     voiceInputActive = true;
+    latestGateId = "";
     responseGate.abandon("new speech started before the gate completed");
     setState("listening", "A ouvir", "Continua — não vou interromper.");
   } else if (type === "input_audio_buffer.speech_stopped") {
     voiceInputActive = false;
     setState("thinking", "A perceber", "A decidir silenciosamente se a fala foi dirigida à Mira.");
-    responseGate.request({ itemId: event.item_id });
+    prepareZepTurn(event.item_id);
+    latestGateId = responseGate.request({ itemId: event.item_id });
   } else if (type === "response.created") {
     responseActive = true;
   } else if (type.includes("output_audio.started")) {
@@ -483,18 +487,30 @@ function handleRealtimeEvent(raw) {
     "response.audio_transcript.done",
     "response.output_audio_transcript.done",
   ].includes(type)) {
-    updateTranscript("assistant", String(event.transcript || event.text || ""), true);
+    updateTranscript("assistant", String(event.transcript || event.text || ""), true, {
+      turnId: event.item_id || event.response_id,
+    });
   } else if (["conversation.input_transcript.delta", "conversation.item.input_audio_transcription.delta"].includes(type)) {
     updateTranscript("user", String(event.delta || ""), false);
   } else if (type === "conversation.item.input_audio_transcription.completed") {
     responseGate.noteTranscript({ itemId: event.item_id, text: event.transcript });
-    updateTranscript("user", String(event.transcript || ""), true);
+    const finalText = String(event.transcript || "").trim();
+    const turnId = String(event.item_id || `voice-${crypto.randomUUID()}`);
+    const memoryPromise = rememberZepTurn({
+      role: "user",
+      text: finalText,
+      source: "voice",
+      turnId,
+      returnContext: true,
+    });
+    attachZepTurn(turnId, memoryPromise);
+    updateTranscript("user", finalText, true, { turnId, memoryAlreadyStarted: true });
   } else if (type === "error" || type === "conversation.item.input_audio_transcription.failed") {
     fail(String(event.error?.message || event.error || "O Realtime devolveu um erro."));
   }
 }
 
-function updateTranscript(role, text, done) {
+function updateTranscript(role, text, done, { turnId = "", memoryAlreadyStarted = false } = {}) {
   const finalText = String(text || "").trim();
   if (done && finalText) {
     const previous = recentFinals.get(role);
@@ -516,6 +532,13 @@ function updateTranscript(role, text, done) {
     if (finalText) {
       const consultJobId = role === "assistant" ? pendingLiveConsultId : "";
       recordJournal(role, finalText, "voice", consultJobId);
+      if (!memoryAlreadyStarted) void rememberZepTurn({
+        role,
+        text: finalText,
+        source: "voice",
+        turnId: turnId || `${role}-${crypto.randomUUID()}`,
+        returnContext: false,
+      });
       if (consultJobId) pendingLiveConsultId = "";
     }
   } else {
@@ -535,20 +558,109 @@ function addTypedMessage(text) {
   recordJournal("user", text, "typed");
 }
 
-function sendText(event) {
+async function sendText(event) {
   event.preventDefault();
   const text = prompt.value.trim();
   if (!text || eventsChannel?.readyState !== "open") return;
   prompt.value = "";
+  sendButton.disabled = true;
+  latestGateId = "";
   responseGate.abandon("explicit typed message superseded the voice gate");
   addTypedMessage(text);
   sendRealtime({
     type: "conversation.item.create",
     item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
   });
-  queuedResponse = true;
-  maybeCreateResponse();
   setState("thinking", "A perceber", "A preparar uma resposta à mensagem escrita.");
+  const result = await rememberZepTurn({
+    role: "user",
+    text,
+    source: "typed",
+    turnId: `typed-${crypto.randomUUID()}`,
+    returnContext: true,
+  });
+  realtimeZepContext.replace(result.context || "");
+  queuedResponse = true;
+  sendButton.disabled = false;
+  maybeCreateResponse();
+}
+
+async function handleGateDecision(result) {
+  if (!latestGateId || result.gateId !== latestGateId) {
+    pendingZepTurns.delete(String(result.itemId || ""));
+    return;
+  }
+  if (result.decision === "RESPOND") {
+    const memory = await waitForZepTurn(result.itemId);
+    if (!latestGateId || result.gateId !== latestGateId) return;
+    realtimeZepContext.replace(memory.context || "");
+    queuedResponse = true;
+    setState("thinking", "A responder", memory.context
+      ? "A fala foi dirigida à Mira; memória histórica relevante aplicada."
+      : "A fala foi dirigida à Mira.");
+  } else {
+    pendingZepTurns.delete(String(result.itemId || ""));
+    setState("listening", "A ouvir", "A Mira mantém-se em silêncio.");
+  }
+  latestGateId = "";
+  maybeCreateResponse();
+}
+
+function prepareZepTurn(turnId) {
+  const key = String(turnId || "");
+  if (!key || pendingZepTurns.has(key)) return;
+  let resolveTurn;
+  const promise = new Promise((resolve) => { resolveTurn = resolve; });
+  pendingZepTurns.set(key, { promise, resolve: resolveTurn });
+}
+
+function attachZepTurn(turnId, memoryPromise) {
+  const pending = pendingZepTurns.get(String(turnId || ""));
+  if (!pending) return;
+  Promise.resolve(memoryPromise).then(pending.resolve, () => pending.resolve({ context: "" }));
+}
+
+async function waitForZepTurn(turnId) {
+  const key = String(turnId || "");
+  const pending = pendingZepTurns.get(key);
+  if (!pending) return { context: "" };
+  let timer;
+  try {
+    return await Promise.race([
+      pending.promise,
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ context: "", timedOut: true }), zepContextWaitMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    pendingZepTurns.delete(key);
+  }
+}
+
+async function rememberZepTurn({ role, text, source, turnId, returnContext }) {
+  const finalText = String(text || "").trim();
+  if (!finalText) return { context: "", ingested: false, turnId };
+  try {
+    const response = await fetch("/api/memory/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        final: true,
+        role,
+        text: finalText,
+        source,
+        spaceId: xSpaceRoomId || memorySessionId,
+        turnId,
+        timestamp: new Date().toISOString(),
+        returnContext: Boolean(returnContext),
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Zep memory request failed");
+    if (result.turnId !== turnId) return { context: "", ingested: false, correlationMismatch: true };
+    return result;
+  } catch {
+    return { context: "", ingested: false, turnId };
+  }
 }
 
 function discoverFunctionCalls(items) {
@@ -859,6 +971,9 @@ function disconnect(showIdle) {
   activeToolCalls.clear();
   transientEvaluations.clear();
   pendingLiveConsultId = "";
+  memorySessionId = "";
+  pendingZepTurns.clear();
+  realtimeZepContext.reset();
   handledToolCalls.clear();
   toolDrafts.clear();
   eventsChannel?.close();
@@ -873,6 +988,7 @@ function disconnect(showIdle) {
   responseActive = false;
   queuedResponse = false;
   voiceInputActive = false;
+  latestGateId = "";
   responseGate.reset();
   setControls(false);
   if (showIdle) setState("idle", "Pronto", `Sem API key: ${MODEL} por OpenClaw e cérebro gpt-5.6-luna low pelo Codex app-server.`);

@@ -28,11 +28,43 @@ test("aceita apenas legendas com handle, texto final já filtrado e identidade v
     eventId: "caption-1",
     handle: "pessoa_1",
     displayName: "Pessoa",
+    chatUserId: "",
+    twitterId: "",
     text: "Foi isto que eu disse.",
     receivedAtMs: 1234,
   });
-  assert.equal(parseXSpaceCaption({ eventId: "x", text: "sem autor", receivedAtMs: 1 }), null);
+  assert.equal(parseXSpaceCaption({ eventId: "x", text: "sem autor", receivedAtMs: 1 }).handle, "");
   assert.equal(parseXSpaceCaption({ eventId: "x", handle: "autor", text: "", receivedAtMs: 1 }), null);
+});
+
+test("preserva IDs estruturados e aceita atribuição unknown sem adivinhar display name", () => {
+  const identified = parseXSpaceCaption({
+    eventId: "caption-id",
+    handle: "alice",
+    displayName: "Alice",
+    chatUserId: "chat-42",
+    twitterId: "twitter-42",
+    text: "Final",
+    receivedAtMs: 2,
+  });
+  assert.equal(identified.twitterId, "twitter-42");
+  assert.equal(identified.chatUserId, "chat-42");
+  const unknown = parseXSpaceCaption({
+    eventId: "caption-unknown",
+    displayName: "Alice",
+    text: "Final sem identidade estruturada",
+    receivedAtMs: 3,
+  });
+  assert.equal(unknown.handle, "");
+  assert.equal(unknown.displayName, "Alice");
+});
+
+test("o listener deriva event ID determinístico e owner da metadata estruturada do Space", () => {
+  const listener = readFileSync(new URL("../xspace/xspace_listener.py", import.meta.url), "utf8");
+  assert.match(listener, /xcap_\{hashlib\.sha256\(raw_event\)\.hexdigest\(\)\[:40\]\}/);
+  assert.match(listener, /creator_results/);
+  assert.match(listener, /twitter_screen_name/);
+  assert.match(listener, /"type": "space_metadata"/);
 });
 
 test("o contexto XCAP preserva explicitamente quem disse o quê", () => {

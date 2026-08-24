@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
 
 import {
   CODEX_TOOL,
@@ -14,6 +15,7 @@ import {
   normalizeVoice,
   send,
   statusPayload,
+  createVoiceServer,
 } from "../server.mjs";
 
 test("fixa o modelo e a rota do broker Realtime 2.1", () => {
@@ -88,4 +90,116 @@ test("a API local não devolve o token OAuth no estado", () => {
   assert.equal(body.codex.reasoningEffort, "low");
   assert.equal(body.xspace.state, "disabled");
   assert.equal(JSON.stringify(body).includes("token"), false);
+});
+
+test("a API de memória aceita apenas finais e mantém correlação por turn ID", async () => {
+  class FakeXSpace extends EventEmitter {
+    status = {
+      enabled: true,
+      state: "connected",
+      roomId: "space-http",
+      ownerHandle: "owner_auto",
+      ownerIdentitySource: "x_space_metadata",
+      captionCount: 0,
+    };
+    start() {}
+    stop() {}
+    configure() { return this.status; }
+  }
+  const xspace = new FakeXSpace();
+  const coordinatorCalls = [];
+  const zepTurns = {
+    async ingestX(turn) { coordinatorCalls.push(["x", turn]); return { ingested: true }; },
+    async ingestBrowser(turn, options) {
+      coordinatorCalls.push(["browser", turn, options]);
+      return {
+        ingested: false,
+        pendingIngest: true,
+        captionWaitMs: 900,
+        context: "prior debate",
+        turnId: turn.turnId,
+        threadId: "thread-http",
+      };
+    },
+  };
+  const runtime = createVoiceServer({
+    port: 3001,
+    host: "127.0.0.1",
+    xspace,
+    zep: {
+      status: { enabled: true, configured: true, contextTimeoutMs: 100 },
+      async start() { return true; },
+    },
+    zepConfig: {
+      requested: true,
+      enabled: true,
+      apiKey: "not-logged",
+      userId: "mira",
+      ownerHandle: "",
+      ownerCaptionWaitMs: 900,
+      contextTimeoutMs: 100,
+      contextMaxChars: 1_000,
+    },
+    zepTurns,
+    broker: { async cleanup() {}, async authConfigured() { return true; } },
+    codex: {
+      status() { return { running: false }; },
+      async close() {},
+      journal: { append() { return { seq: 1 }; }, appendResponseGate(value) { return value; } },
+    },
+  });
+  await new Promise((resolve) => runtime.server.listen(0, "127.0.0.1", resolve));
+  const address = runtime.server.address();
+  const endpoint = `http://127.0.0.1:${address.port}/api/memory/turn`;
+  try {
+    const partial = await fetch(endpoint, {
+      method: "POST",
+      headers: { Origin: "http://127.0.0.1:3001", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        final: false,
+        role: "user",
+        source: "voice",
+        spaceId: "space-http",
+        turnId: "partial-1",
+        text: "partial",
+      }),
+    });
+    assert.equal(partial.status, 400);
+
+    const final = await fetch(endpoint, {
+      method: "POST",
+      headers: { Origin: "http://127.0.0.1:3001", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        final: true,
+        role: "user",
+        source: "voice",
+        spaceId: "space-http",
+        turnId: "voice-turn-1",
+        text: "Mira, what do you remember?",
+        returnContext: true,
+      }),
+    });
+    assert.equal(final.status, 200);
+    const result = await final.json();
+    assert.equal(result.turnId, "voice-turn-1");
+    assert.equal(result.context, "prior debate");
+    assert.equal(result.pendingIngest, true);
+    assert.equal(coordinatorCalls[0][1].speakerKind, "owner");
+    assert.equal(coordinatorCalls[0][2].xspace.ownerHandle, "owner_auto");
+
+    xspace.emit("caption", {
+      final: true,
+      eventId: "x-final-1",
+      spaceId: "space-http",
+      handle: "owner_auto",
+      displayName: "Owner",
+      text: "Mira, what do you remember?",
+      receivedAtMs: 10,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(coordinatorCalls[1][0], "x");
+    assert.equal(coordinatorCalls[1][1].speakerKind, "owner");
+  } finally {
+    await new Promise((resolve) => runtime.server.close(resolve));
+  }
 });

@@ -44,6 +44,7 @@ export function resolveXSpaceConfig(env, projectRoot) {
     python: (env.X_PYTHON || env.KIKA_X_PYTHON || "").trim()
       || firstExisting([localPython, codexVoicePython]) || "python3",
     selfHandle: String(env.X_SELF_HANDLE || "nexo_theagent").replace(/^@/, "").toLowerCase(),
+    ownerHandle: String(env.X_OWNER_HANDLE || "").replace(/^@/, "").toLowerCase(),
     projectRoot,
   };
 }
@@ -54,9 +55,11 @@ export function parseXSpaceCaption(value) {
   const handle = typeof value.handle === "string" ? value.handle.replace(/^@/, "").toLowerCase() : "";
   const text = typeof value.text === "string" ? value.text.trim().slice(0, 1_500) : "";
   const receivedAtMs = Number(value.receivedAtMs);
-  if (!eventId || !HANDLE.test(handle) || !text || !Number.isFinite(receivedAtMs)) return null;
+  if (!eventId || (handle && !HANDLE.test(handle)) || !text || !Number.isFinite(receivedAtMs)) return null;
   const displayName = typeof value.displayName === "string" ? value.displayName.trim().slice(0, 80) : "";
-  return { eventId, handle, displayName, text, receivedAtMs };
+  const chatUserId = typeof value.chatUserId === "string" ? value.chatUserId.trim().slice(0, 80) : "";
+  const twitterId = typeof value.twitterId === "string" ? value.twitterId.trim().slice(0, 80) : "";
+  return { eventId, handle, displayName, chatUserId, twitterId, text, receivedAtMs };
 }
 
 export function buildXSpaceContext(caption) {
@@ -134,6 +137,22 @@ export class XSpaceSource extends EventEmitter {
         });
         return;
       }
+      if (value.type === "space_metadata" && value.roomId === this.#config.roomId) {
+        const ownerHandle = typeof value.owner?.handle === "string"
+          ? value.owner.handle.replace(/^@/, "").toLowerCase()
+          : "";
+        this.#setStatus({
+          ...this.#status,
+          ownerHandle: HANDLE.test(this.#config.ownerHandle) ? this.#config.ownerHandle
+            : HANDLE.test(ownerHandle) ? ownerHandle : undefined,
+          ownerDisplayName: typeof value.owner?.displayName === "string"
+            ? value.owner.displayName.trim().slice(0, 80) : undefined,
+          ownerTwitterId: typeof value.owner?.twitterId === "string"
+            ? value.owner.twitterId.trim().slice(0, 80) : undefined,
+          ownerIdentitySource: HANDLE.test(this.#config.ownerHandle) ? "env_override" : "x_space_metadata",
+        });
+        return;
+      }
       if (value.type !== "caption") return;
       const caption = parseXSpaceCaption(value);
       if (!caption) return;
@@ -144,7 +163,9 @@ export class XSpaceSource extends EventEmitter {
         lastCaptionAtMs: caption.receivedAtMs,
       };
       this.emit("status", this.status);
-      if (caption.handle !== this.#config.selfHandle) this.emit("caption", caption);
+      if (caption.handle !== this.#config.selfHandle) {
+        this.emit("caption", { ...caption, final: true, spaceId: this.#config.roomId });
+      }
     } catch {
       // Uma linha JSONL inválida nunca deve afetar a sessão de voz.
     }

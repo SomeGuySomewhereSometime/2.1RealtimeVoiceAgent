@@ -69,7 +69,7 @@ test("o gate usa uma response textual out-of-band do próprio Realtime, sem ferr
   assert.deepEqual(event.response.output_modalities, ["text"]);
   assert.deepEqual(event.response.tools, []);
   assert.equal(event.response.tool_choice, "none");
-  assert.equal(event.response.max_output_tokens, 4);
+  assert.equal(event.response.max_output_tokens, 64);
   assert.equal(event.response.metadata.response_purpose, RESPONSE_GATE_PURPOSE);
   assert.match(RESPONSE_GATE_PROMPT, /whether Mira should speak/);
   assert.match(RESPONSE_GATE_PROMPT, /When genuinely ambiguous, prefer IGNORE/);
@@ -111,9 +111,23 @@ test("output inválido, falha e timeout fazem fail-closed para IGNORE", () => {
 
   const failed = createHarness();
   failed.gate.request();
-  failed.gate.handleResponseDone(completedResponse(failed.createResponse(), "", "failed"));
+  failed.gate.handleResponseDone({
+    ...completedResponse(failed.createResponse(), "", "incomplete"),
+    status_details: { reason: "max_output_tokens" },
+    max_output_tokens: 64,
+    usage: {
+      output_tokens: 64,
+      output_token_details: { text_tokens: 0, reasoning_tokens: 64 },
+    },
+  });
   assert.equal(failed.decisions[0].decision, "IGNORE");
-  assert.match(failed.logs[0].error, /status failed/);
+  assert.match(failed.logs[0].error, /status incomplete/);
+  assert.equal(failed.logs[0].responseStatus, "incomplete");
+  assert.equal(failed.logs[0].statusReason, "max_output_tokens");
+  assert.equal(failed.logs[0].outputTokens, 64);
+  assert.equal(failed.logs[0].outputTextTokens, 0);
+  assert.equal(failed.logs[0].reasoningTokens, 64);
+  assert.equal(failed.logs[0].maxOutputTokens, 64);
 
   const timedOut = createHarness();
   timedOut.gate.request();
@@ -173,4 +187,36 @@ test("a integração do browser separa voz, texto, XCAP, gate e tool calls", () 
   const handlerPrefix = client.slice(client.indexOf("function handleRealtimeEvent"), client.indexOf('if (type === "input_audio_buffer.speech_started"'));
   assert.match(handlerPrefix, /handleResponseDone\(event\.response\)\) return/);
   assert.match(handlerPrefix, /handleTextEvent\(event\)\) return/);
+});
+
+test("memória final permanece separada do gate e retrieval só atrasa RESPOND", () => {
+  const client = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
+  const finalInput = client.slice(
+    client.indexOf('type === "conversation.item.input_audio_transcription.completed"'),
+    client.indexOf('type === "error"', client.indexOf('type === "conversation.item.input_audio_transcription.completed"')),
+  );
+  assert.match(finalInput, /rememberZepTurn/);
+  assert.match(finalInput, /finalText/);
+  assert.doesNotMatch(finalInput, /event\.delta/);
+
+  const decision = client.slice(
+    client.indexOf("async function handleGateDecision"),
+    client.indexOf("function prepareZepTurn"),
+  );
+  const respond = decision.slice(decision.indexOf('result.decision === "RESPOND"'), decision.indexOf("} else {"));
+  const ignore = decision.slice(decision.indexOf("} else {"));
+  assert.match(respond, /await waitForZepTurn/);
+  assert.match(respond, /realtimeZepContext\.replace/);
+  assert.match(respond, /queuedResponse\s*=\s*true/);
+  assert.doesNotMatch(ignore, /await waitForZepTurn/);
+  assert.match(ignore, /pendingZepTurns\.delete/);
+  assert.match(decision, /result\.gateId !== latestGateId/);
+
+  const memoryRequest = client.slice(
+    client.indexOf("async function rememberZepTurn"),
+    client.indexOf("function discoverFunctionCalls"),
+  );
+  assert.match(memoryRequest, /final:\s*true/);
+  assert.match(memoryRequest, /turnId/);
+  assert.doesNotMatch(memoryRequest, /retrieved_long_term_memory|ZEP_CONTEXT_PREAMBLE/);
 });
