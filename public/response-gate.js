@@ -64,6 +64,41 @@ function gateMetadata(value) {
   return value?.metadata && typeof value.metadata === "object" ? value.metadata : {};
 }
 
+function responseTelemetry(response) {
+  const usage = response?.usage && typeof response.usage === "object" ? response.usage : {};
+  const tokenDetails = usage.output_token_details && typeof usage.output_token_details === "object"
+    ? usage.output_token_details
+    : usage.output_tokens_details && typeof usage.output_tokens_details === "object"
+      ? usage.output_tokens_details
+      : {};
+  const tokenCount = (value) => Number.isFinite(Number(value))
+    ? Math.max(0, Math.round(Number(value)))
+    : undefined;
+  const responseStatus = String(response?.status || "").trim();
+  const statusReason = String(
+    response?.status_details?.reason || response?.incomplete_details?.reason || "",
+  ).trim();
+  return {
+    ...(responseStatus ? { responseStatus } : {}),
+    ...(statusReason ? { statusReason } : {}),
+    ...(tokenCount(usage.output_tokens) !== undefined
+      ? { outputTokens: tokenCount(usage.output_tokens) }
+      : {}),
+    ...(tokenCount(tokenDetails.text_tokens) !== undefined
+      ? { outputTextTokens: tokenCount(tokenDetails.text_tokens) }
+      : {}),
+    ...(tokenCount(tokenDetails.audio_tokens) !== undefined
+      ? { outputAudioTokens: tokenCount(tokenDetails.audio_tokens) }
+      : {}),
+    ...(tokenCount(tokenDetails.reasoning_tokens) !== undefined
+      ? { reasoningTokens: tokenCount(tokenDetails.reasoning_tokens) }
+      : {}),
+    ...(tokenCount(response?.max_output_tokens) !== undefined
+      ? { maxOutputTokens: tokenCount(response.max_output_tokens) }
+      : {}),
+  };
+}
+
 export class MiraResponseGate {
   #send;
   #onDecision;
@@ -124,7 +159,7 @@ export class MiraResponseGate {
           instructions: RESPONSE_GATE_PROMPT,
           tools: [],
           tool_choice: "none",
-          max_output_tokens: 4,
+          max_output_tokens: 64,
           metadata: {
             response_purpose: RESPONSE_GATE_PURPOSE,
             gate_id: gateId,
@@ -195,12 +230,13 @@ export class MiraResponseGate {
     const completed = !response?.status || response.status === "completed";
     const output = responseOutputText(response) || this.#active.output;
     const parsed = completed ? parseGateDecision(output) : "";
-    if (parsed) this.#finish(parsed);
+    const telemetry = responseTelemetry(response);
+    if (parsed) this.#finish(parsed, "", telemetry);
     else {
       const detail = completed
         ? `invalid response gate output: ${String(output || "<empty>").trim().slice(0, 120)}`
         : `response gate ended with status ${String(response?.status || "unknown")}`;
-      this.#finish("IGNORE", detail);
+      this.#finish("IGNORE", detail, telemetry);
     }
     return true;
   }
@@ -230,7 +266,7 @@ export class MiraResponseGate {
     this.#active = undefined;
   }
 
-  #finish(decision, error = "") {
+  #finish(decision, error = "", telemetry = {}) {
     const gate = this.#active;
     if (!gate) return;
     if (gate.timer !== undefined) this.#clearTimer(gate.timer);
@@ -242,6 +278,7 @@ export class MiraResponseGate {
       latencyMs: Math.max(0, Math.round(this.#now() - gate.startedAt)),
       ...(gate.speaker ? { speaker: gate.speaker } : {}),
       ...(gate.text ? { text: gate.text } : {}),
+      ...telemetry,
       ...(error ? { error: String(error).slice(0, 500) } : {}),
     };
     try { this.#onLog(result); } catch {}

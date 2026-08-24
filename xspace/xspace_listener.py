@@ -9,7 +9,6 @@ import hashlib
 import json
 import sys
 import time
-import uuid
 from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
@@ -79,7 +78,7 @@ def parse_caption(message: object, orjson_module) -> dict | None:
         body.get("twitter_screen_name"), sender.get("username"), sender.get("screen_name"),
     ).lstrip("@")[:15]
     text = first_value(*(body.get(key) for key in text_keys))[:1_500]
-    if not handle or not text:
+    if not text:
         return None
 
     display_name = first_value(
@@ -88,9 +87,10 @@ def parse_caption(message: object, orjson_module) -> dict | None:
     )[:80]
     chat_user_id = first_value(body.get("user_id"), body.get("userId"), sender.get("user_id"))[:80]
     twitter_id = first_value(body.get("twitter_id"), body.get("twitterId"), sender.get("twitter_id"))[:80]
+    raw_event = message if isinstance(message, bytes) else str(message).encode()
     return {
         "type": "caption",
-        "eventId": str(uuid.uuid4()),
+        "eventId": f"xcap_{hashlib.sha256(raw_event).hexdigest()[:40]}",
         "handle": handle,
         "displayName": display_name,
         "chatUserId": chat_user_id,
@@ -98,6 +98,34 @@ def parse_caption(message: object, orjson_module) -> dict | None:
         "text": text,
         "receivedAtMs": int(time.time() * 1000),
     }
+
+
+def extract_space_owner(spaces: list[dict]) -> dict:
+    """Read the Space creator/admin identity from structured AudioSpace metadata."""
+    for item in spaces:
+        audio_space = (item.get("data") or {}).get("audioSpace") or {}
+        metadata = audio_space.get("metadata") or {}
+        creator = ((metadata.get("creator_results") or {}).get("result") or {})
+        legacy = creator.get("legacy") or {}
+        owner = {
+            "handle": first_value(legacy.get("screen_name")),
+            "displayName": first_value(legacy.get("name")),
+            "twitterId": first_value(creator.get("rest_id")),
+        }
+        admins = ((audio_space.get("participants") or {}).get("admins") or [])
+        if admins:
+            admin = admins[0] or {}
+            owner = {
+                "handle": first_value(owner["handle"], admin.get("twitter_screen_name")),
+                "displayName": first_value(owner["displayName"], admin.get("display_name")),
+                "twitterId": first_value(
+                    owner["twitterId"],
+                    (admin.get("user_results") or {}).get("rest_id"),
+                ),
+            }
+        if owner["handle"] or owner["twitterId"]:
+            return owner
+    return {}
 
 
 async def listen_chat(chat: dict, orjson_module, websockets_module) -> None:
@@ -154,6 +182,11 @@ def listen_once(room_id: str, cookies_file: Path) -> None:
     spaces = scraper.spaces(rooms=[room_id])
     if not spaces:
         raise RuntimeError("Space não encontrado")
+    print(json.dumps({
+        "type": "space_metadata",
+        "roomId": room_id,
+        "owner": extract_space_owner(spaces),
+    }, ensure_ascii=False), flush=True)
     asyncio.run(listen_chats(scraper, spaces))
 
 

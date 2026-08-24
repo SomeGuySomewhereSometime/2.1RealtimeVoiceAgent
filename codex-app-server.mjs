@@ -174,7 +174,21 @@ export class ConversationJournal {
     return row;
   }
 
-  appendResponseGate({ at, decision, latencyMs, speaker = "", text = "", error = "" }) {
+  appendResponseGate({
+    at,
+    decision,
+    latencyMs,
+    speaker = "",
+    text = "",
+    responseStatus = "",
+    statusReason = "",
+    outputTokens,
+    outputTextTokens,
+    outputAudioTokens,
+    reasoningTokens,
+    maxOutputTokens,
+    error = "",
+  }) {
     if (decision !== "RESPOND" && decision !== "IGNORE") {
       throw new Error("Decisão do response gate inválida.");
     }
@@ -185,10 +199,30 @@ export class ConversationJournal {
       latencyMs: Math.max(0, Math.min(60_000, Math.round(Number(latencyMs) || 0))),
       ...(String(speaker || "").trim() ? { speaker: String(speaker).trim().slice(0, 180) } : {}),
       ...(String(text || "").trim() ? { text: String(text).trim().slice(0, 12_000) } : {}),
+      ...(String(responseStatus || "").trim()
+        ? { responseStatus: String(responseStatus).trim().slice(0, 100) }
+        : {}),
+      ...(String(statusReason || "").trim()
+        ? { statusReason: String(statusReason).trim().slice(0, 180) }
+        : {}),
+      ...this.#responseGateTokenCounts({
+        outputTokens,
+        outputTextTokens,
+        outputAudioTokens,
+        reasoningTokens,
+        maxOutputTokens,
+      }),
       ...(String(error || "").trim() ? { error: String(error).trim().slice(0, 500) } : {}),
     };
     appendFileSync(this.#responseGatePath, `${JSON.stringify(row)}\n`, { mode: 0o600 });
     return row;
+  }
+
+  #responseGateTokenCounts(counts) {
+    return Object.fromEntries(Object.entries(counts).flatMap(([key, value]) => {
+      if (value === "" || value === null || value === undefined || !Number.isFinite(Number(value))) return [];
+      return [[key, Math.max(0, Math.min(1_000_000, Math.round(Number(value))))]];
+    }));
   }
 
   readAll() {

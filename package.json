@@ -4,14 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs",
-    "dev": "node --watch server.mjs",
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "dev": "node --env-file-if-exists=.env --watch server.mjs",
     "auth": "OPENCLAW_STATE_DIR=.openclaw-state openclaw models auth login --provider openai --profile-id openai:realtime-21",
     "xspace:install": "bash scripts/install-xspace-deps.sh",
+    "zep:ontology": "node --env-file-if-exists=.env scripts/setup-zep-ontology.mjs",
+    "zep:ontology:apply": "node --env-file-if-exists=.env scripts/setup-zep-ontology.mjs --apply",
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check server.mjs && node --check codex-app-server.mjs && node --check xspace-source.mjs && node --check public/app.js && python3 -m py_compile xspace/xspace_listener.py && npm test"
+    "check": "node --check server.mjs && node --check codex-app-server.mjs && node --check xspace-source.mjs && node --check zep-memory.mjs && node --check zep-ontology.mjs && node --check public/app.js && node --check public/zep-context.js && node --check scripts/setup-zep-ontology.mjs && python3 -m py_compile xspace/xspace_listener.py && npm test"
   },
   "dependencies": {
+    "@getzep/zep-cloud": "^3.28.0",
     "openclaw": "2026.8.1-beta.2",
     "ws": "^8.18.3"
   }
