@@ -18,25 +18,53 @@ function config(overrides = {}) {
     enabled: true,
     disabledReason: "",
     apiKey: "secret-never-log",
-    userId: "mira-main-user",
+    userId: "owner-main",
+    ownerName: "Owner",
     ownerHandle: "owner_x",
     contextTimeoutMs: 100,
     contextMaxChars: 12_000,
+    ingestTimeoutMs: 1_000,
     ownerCaptionWaitMs: 1_200,
     ...overrides,
   };
 }
 
-function fakeClient({ context = "historical context", addMessages, getUserContext } = {}) {
-  const calls = { users: [], threads: [], messages: [], contexts: [] };
+function fakeClient({
+  context = "historical context",
+  addMessages,
+  getUserContext,
+  getUser,
+  addUser,
+  updateUser,
+  createThread,
+  getThread,
+} = {}) {
+  const calls = { users: [], threads: [], messages: [], threadGets: [], contexts: [] };
   return {
     calls,
     user: {
-      async get(userId) { calls.users.push(["get", userId]); return { userId }; },
-      async add(value) { calls.users.push(["add", value]); return value; },
+      async get(userId) {
+        calls.users.push(["get", userId]);
+        return getUser ? getUser(userId) : { userId, firstName: "Owner" };
+      },
+      async add(value) {
+        calls.users.push(["add", value]);
+        return addUser ? addUser(value) : value;
+      },
+      async update(userId, value) {
+        calls.users.push(["update", userId, value]);
+        return updateUser ? updateUser(userId, value) : { userId, ...value };
+      },
     },
     thread: {
-      async create(value) { calls.threads.push(value); return value; },
+      async create(value, options) {
+        calls.threads.push(value);
+        return createThread ? createThread(value, options, calls) : value;
+      },
+      async get(threadId, request, options) {
+        calls.threadGets.push({ threadId, request, options });
+        return getThread ? getThread(threadId, request, options, calls) : { messages: [], totalCount: 0 };
+      },
       async addMessages(threadId, request, options) {
         calls.messages.push({ threadId, request, options });
         return addMessages ? addMessages(threadId, request, options, calls) : { context };
@@ -64,16 +92,44 @@ function external(overrides = {}) {
 }
 
 test("a configuração é fail-open e nunca precisa de uma chave hardcoded", () => {
-  assert.equal(resolveZepConfig({ ZEP_ENABLED: "true", ZEP_USER_ID: "mira" }).enabled, false);
-  assert.equal(resolveZepConfig({ ZEP_ENABLED: "false", ZEP_API_KEY: "x", ZEP_USER_ID: "mira" }).enabled, false);
+  assert.equal(resolveZepConfig({ ZEP_ENABLED: "true", ZEP_USER_ID: "owner-main" }).enabled, false);
+  assert.equal(resolveZepConfig({ ZEP_ENABLED: "false", ZEP_API_KEY: "x", ZEP_USER_ID: "owner-main" }).enabled, false);
   const enabled = resolveZepConfig({
     ZEP_ENABLED: "true",
     ZEP_API_KEY: "from-environment",
-    ZEP_USER_ID: "mira",
+    ZEP_USER_ID: "owner-main",
     ZEP_CONTEXT_TIMEOUT_MS: "250",
   });
   assert.equal(enabled.enabled, true);
   assert.equal(enabled.contextTimeoutMs, 250);
+  assert.equal(enabled.ownerName, "Owner");
+  assert.equal(resolveZepConfig({ ZEP_OWNER_NAME: "Mira" }).ownerName, "Owner");
+});
+
+test("Zep User é criado como owner e nunca recebe o nome Mira", async () => {
+  const notFound = Object.assign(new Error("not found"), { statusCode: 404 });
+  const client = fakeClient({ getUser: async () => { throw notFound; } });
+  const service = new ZepMemoryService({
+    config: config({ ownerName: "Human Owner" }),
+    client,
+    logger: { info() {}, warn() {} },
+  });
+  assert.equal(await service.start(), true);
+  const created = client.calls.users.find(([kind]) => kind === "add")[1];
+  assert.equal(created.userId, "owner-main");
+  assert.equal(created.firstName, "Human Owner");
+  assert.notEqual(created.firstName, "Mira");
+});
+
+test("um User legado chamado Mira é reparado para o nome seguro do owner", async () => {
+  const client = fakeClient({ getUser: async (userId) => ({ userId, firstName: "Mira" }) });
+  const service = new ZepMemoryService({ config: config(), client, logger: { info() {}, warn() {} } });
+  assert.equal(await service.start(), true);
+  assert.deepEqual(client.calls.users.find(([kind]) => kind === "update"), [
+    "update",
+    "owner-main",
+    { firstName: "Owner" },
+  ]);
 });
 
 test("só normaliza turns finais e mantém transcript e identidade em campos separados", () => {
@@ -178,27 +234,131 @@ test("turn ID e fingerprint tornam finalized turns idempotentes em replay", asyn
   assert.equal(client.calls.messages.length, 1);
 });
 
-test("ingestão é ordenada por thread e returnContext fica correlacionado ao turn ID", async () => {
+test("ingestão dedicada é ordenada por thread e nunca pede returnContext", async () => {
   let releaseFirst;
   const firstBlocked = new Promise((resolve) => { releaseFirst = resolve; });
   const client = fakeClient({
     async addMessages(_threadId, request) {
       if (request.messages[0].metadata.turnId === "turn-1") await firstBlocked;
-      return { context: `context:${request.messages[0].metadata.turnId}` };
+      return {};
     },
   });
   const service = new ZepMemoryService({ config: config(), client, logger: { info() {}, warn() {} } });
-  const one = service.ingest({ ...external({ eventId: "turn-1", text: "One" }), turnId: "turn-1" }, { returnContext: true });
-  const two = service.ingest({ ...external({ eventId: "turn-2", text: "Two" }), turnId: "turn-2" }, { returnContext: true });
+  const one = service.ingest({ ...external({ eventId: "turn-1", text: "One" }), turnId: "turn-1" });
+  const two = service.ingest({ ...external({ eventId: "turn-2", text: "Two" }), turnId: "turn-2" });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(client.calls.messages.length, 1);
   releaseFirst();
-  assert.equal((await one).context, "context:turn-1");
-  assert.equal((await two).context, "context:turn-2");
+  assert.equal((await one).ingested, true);
+  assert.equal((await two).ingested, true);
   assert.equal(client.calls.messages.length, 2);
+  assert.ok(client.calls.messages.every((call) => call.request.returnContext === false));
+  assert.ok(client.calls.messages.every((call) => call.options.maxRetries === 0));
 });
 
-test("retrieval sem ingestão é serializado e correlacionado para owner via X", async () => {
+test("reconnect consulta turnId persistido e não cria outro episódio", async () => {
+  const remoteMessages = [];
+  let threadExists = false;
+  const shared = {
+    async createThread() {
+      if (threadExists) throw Object.assign(new Error("already exists"), { statusCode: 409 });
+      threadExists = true;
+    },
+    async getThread() {
+      return { messages: remoteMessages, totalCount: remoteMessages.length };
+    },
+    async addMessages(_threadId, request) {
+      remoteMessages.push(...request.messages);
+      return {};
+    },
+  };
+  const firstClient = fakeClient(shared);
+  const firstService = new ZepMemoryService({ config: config(), client: firstClient, logger: { info() {}, warn() {} } });
+  const turn = external({ eventId: "reconnect-turn" });
+  assert.equal((await firstService.ingest(turn)).ingested, true);
+
+  const reconnectClient = fakeClient(shared);
+  const reconnectService = new ZepMemoryService({ config: config(), client: reconnectClient, logger: { info() {}, warn() {} } });
+  const replay = await reconnectService.ingest(turn);
+  assert.equal(replay.deduplicated, true);
+  assert.equal(remoteMessages.length, 1);
+  assert.equal(reconnectClient.calls.messages.length, 0);
+});
+
+test("retry após resultado incerto confirma turnId antes de voltar a escrever", async () => {
+  const remoteMessages = [];
+  const client = fakeClient({
+    async getThread() { return { messages: remoteMessages, totalCount: remoteMessages.length }; },
+    async addMessages(_threadId, request) {
+      remoteMessages.push(...request.messages);
+      throw new Error("connection reset after write");
+    },
+  });
+  const service = new ZepMemoryService({ config: config(), client, logger: { info() {}, warn() {} } });
+  const result = await service.ingest(external({ eventId: "uncertain-write" }));
+  assert.equal(result.deduplicated, true);
+  assert.equal(client.calls.messages.length, 1);
+  assert.equal(remoteMessages.length, 1);
+});
+
+test("timeout de retrieval devolve fail-open sem cancelar ingestão ainda pendente", async () => {
+  let releaseIngest;
+  let ingestionFinished = false;
+  const blocked = new Promise((resolve) => { releaseIngest = resolve; });
+  const client = fakeClient({
+    async addMessages() {
+      await blocked;
+      ingestionFinished = true;
+      return {};
+    },
+    async getUserContext(_threadId, _request, options) {
+      await new Promise((resolve, reject) => {
+        const keepAlive = setTimeout(resolve, 100);
+        options.abortSignal.addEventListener("abort", () => {
+          clearTimeout(keepAlive);
+          const error = new Error("The user aborted a request");
+          reject(error);
+        }, { once: true });
+      });
+    },
+  });
+  const service = new ZepMemoryService({
+    config: config({ contextTimeoutMs: 20, ingestTimeoutMs: 1_000 }),
+    client,
+    logger: { info() {}, warn() {} },
+  });
+  const ingestion = service.ingest(external({ eventId: "slow-ingest" }));
+  const retrieval = await service.retrieveContext({ spaceId: "space-1", turnId: "slow-ingest" });
+  assert.equal(retrieval.context, "");
+  assert.equal(retrieval.timedOut, true);
+  assert.equal(ingestionFinished, false, "response pode prosseguir antes de a escrita terminar");
+  releaseIngest();
+  assert.equal((await ingestion).ingested, true);
+  assert.equal(ingestionFinished, true, "o turno acaba por ficar ingerido");
+  assert.equal(client.calls.messages.length, 1);
+});
+
+test("o orçamento de retrieval inclui bootstrap lento da thread", async () => {
+  let releaseThread;
+  const blocked = new Promise((resolve) => { releaseThread = resolve; });
+  const client = fakeClient({ createThread: async () => blocked });
+  const service = new ZepMemoryService({
+    config: config({ contextTimeoutMs: 20 }),
+    client,
+    logger: { info() {}, warn() {} },
+  });
+  const keepAlive = setTimeout(() => undefined, 100);
+  const startedAt = Date.now();
+  const result = await service.retrieveContext({ spaceId: "slow-bootstrap", turnId: "slow-bootstrap-turn" });
+  clearTimeout(keepAlive);
+  assert.equal(result.timedOut, true);
+  assert.ok(Date.now() - startedAt < 90, "a criação da thread não pode escapar ao orçamento de retrieval");
+  assert.equal(client.calls.contexts.length, 0, "não inicia getUserContext depois de o orçamento expirar");
+  releaseThread();
+  await new Promise((resolve) => setImmediate(resolve));
+});
+
+test("retrieval sem ingestão é deduplicado e correlacionado para owner via X", async () => {
   const client = fakeClient({ getUserContext: async () => ({ context: "previous debate" }) });
   const service = new ZepMemoryService({ config: config(), client, logger: { info() {}, warn() {} } });
   const first = service.retrieveContext({ spaceId: "space-1", turnId: "voice-item-1" });
@@ -219,10 +379,9 @@ test("correlação textual reconhece captions normalizadas e fragmentos úteis",
 });
 
 test("caption X preferida evita ingestão Realtime duplicada quando chega primeiro", async () => {
-  const calls = { ingest: [], retrieve: [] };
+  const calls = { ingest: [] };
   const zep = {
     async ingest(turn) { calls.ingest.push(turn); return { ingested: true }; },
-    async retrieveContext(value) { calls.retrieve.push(value); return { context: "history", turnId: value.turnId }; },
   };
   const coordinator = new ZepTurnCoordinator({ zep, logger: { info() {} } });
   const ownerCaption = normalizeXSpaceTurn({
@@ -241,13 +400,12 @@ test("caption X preferida evita ingestão Realtime duplicada quando chega primei
     text: "I support UBI because automation will remove many jobs.",
   });
   const result = await coordinator.ingestBrowser(realtime, {
-    returnContext: true,
     xspace: { roomId: "space-1", state: "connected" },
   });
-  assert.equal(result.context, "history");
+  assert.equal(result.context, "");
+  assert.equal(result.deduplicated, true);
   assert.equal(calls.ingest.length, 1, "só a caption X foi ingerida");
   assert.equal(calls.ingest[0].source, "x_spaces");
-  assert.equal(calls.retrieve[0].turnId, "rt-owner-1");
 });
 
 test("Realtime owner tem fallback se caption não chega e caption tardia reutiliza o turn ID", async () => {
@@ -273,7 +431,6 @@ test("Realtime owner tem fallback se caption não chega e caption tardia reutili
     text: "I changed my mind about UBI",
   });
   const result = await coordinator.ingestBrowser(realtime, {
-    returnContext: true,
     xspace: { roomId: "space-1", state: "connected" },
   });
   assert.equal(result.pendingIngest, true);
@@ -308,7 +465,6 @@ test("falha do caption path ingere owner Realtime imediatamente", async () => {
     text: "Remember this even if X failed",
   });
   const result = await coordinator.ingestBrowser(realtime, {
-    returnContext: true,
     xspace: { roomId: "space-1", state: "error" },
   });
   assert.equal(result.ingested, true);
@@ -327,6 +483,16 @@ test("falha e timeout Zep devolvem fallback e nunca expõem a API key em logs", 
   assert.equal(result.ingested, false);
   assert.equal(result.context, "");
   assert.equal(logs.join("\n").includes("secret-never-log"), false);
+
+  const retrievalClient = fakeClient({ getUserContext: async () => { throw new Error("context unavailable"); } });
+  const retrievalService = new ZepMemoryService({
+    config: config(),
+    client: retrievalClient,
+    logger: { info() {}, warn() {} },
+  });
+  const retrieval = await retrievalService.retrieveContext({ spaceId: "space-1", turnId: "failed-context" });
+  assert.equal(retrieval.context, "");
+  assert.equal(retrieval.ingested, false);
 });
 
 test("o context block respeita o limite sem alterar o formato antes de o receber", async () => {
@@ -336,16 +502,14 @@ test("o context block respeita o limite sem alterar o formato antes de o receber
     client,
     logger: { info() {}, warn() {} },
   });
-  const result = await service.ingest(external(), { returnContext: true });
+  const result = await service.retrieveContext({ spaceId: "space-1", turnId: "context-limit" });
   assert.equal(result.context, "abc");
 });
 
 test("simulação de dois Spaces preserva Alice, separa Bob e guarda a resposta da Mira", async () => {
   const client = fakeClient({
-    addMessages: async (_threadId, request) => ({
-      context: request.returnContext
-        ? "@alice42 previously supported UBI because of automation; Bob challenged that view; Mira questioned whether future automation is qualitatively different."
-        : "",
+    getUserContext: async () => ({
+      context: "@alice42 previously supported UBI because of automation; Bob challenged that view; Mira questioned whether future automation is qualitatively different.",
     }),
   });
   const service = new ZepMemoryService({ config: config(), client, logger: { info() {}, warn() {} } });
@@ -384,7 +548,8 @@ test("simulação de dois Spaces preserva Alice, separa Bob e guarda a resposta 
     text: "I've changed my mind. I'm no longer convinced UBI is necessary.",
     receivedAtMs: Date.parse("2026-08-01T10:00:00Z"),
   }, { spaceId: "space-2", ownerHandle: "owner_x" });
-  const result = await service.ingest(aliceSpace2, { returnContext: true });
+  await service.ingest(aliceSpace2);
+  const result = await service.retrieveContext({ spaceId: "space-2", turnId: aliceSpace2.turnId });
 
   const messages = client.calls.messages.map((call) => call.request.messages[0]);
   assert.deepEqual(messages.map((message) => message.name), ["@alice42", "@bob", "Mira", "@alice42"]);

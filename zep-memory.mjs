@@ -6,6 +6,7 @@ const HANDLE = /^[A-Za-z0-9_]{1,15}$/;
 const ALLOWED_BROWSER_SOURCES = new Set(["voice", "typed"]);
 const DEFAULT_CONTEXT_TIMEOUT_MS = 350;
 const DEFAULT_CONTEXT_MAX_CHARS = 12_000;
+const DEFAULT_INGEST_TIMEOUT_MS = 10_000;
 
 function boundedInteger(value, fallback, minimum, maximum) {
   const number = Number(value);
@@ -20,6 +21,30 @@ function enabledFlag(value) {
 
 function clean(value, maximum = 500) {
   return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+
+function isTimeoutError(error) {
+  const name = clean(error?.name, 80).toLowerCase();
+  const message = clean(error?.message, 500).toLowerCase();
+  return name === "aborterror"
+    || name === "timeouterror"
+    || message.includes("aborted a request")
+    || message.includes("request aborted")
+    || message.includes("timed out")
+    || message.includes("timeout");
+}
+
+async function raceWithAbort(operation, abortSignal) {
+  if (abortSignal.aborted) throw abortSignal.reason;
+  let rejectAbort;
+  const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(abortSignal.reason);
+  abortSignal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), aborted]);
+  } finally {
+    abortSignal.removeEventListener("abort", onAbort);
+  }
 }
 
 function isoTimestamp(value, fallback = Date.now()) {
@@ -60,6 +85,11 @@ function normalizeHandle(value) {
   return HANDLE.test(handle) ? handle : "";
 }
 
+function normalizeOwnerName(value) {
+  const name = clean(value, 180);
+  return name && name.toLocaleLowerCase("und") !== "mira" ? name : "Owner";
+}
+
 function metadataFor(turn) {
   return Object.fromEntries(Object.entries({
     source: turn.source,
@@ -75,9 +105,9 @@ function metadataFor(turn) {
   }).filter(([, value]) => value !== undefined && value !== ""));
 }
 
-function messageIdentity(turn) {
+function messageIdentity(turn, ownerName = "Owner") {
   if (turn.speakerKind === "mira") return { role: "assistant", name: "Mira" };
-  if (turn.speakerKind === "owner") return { role: "user", name: "Owner" };
+  if (turn.speakerKind === "owner") return { role: "user", name: normalizeOwnerName(ownerName) };
   if (turn.speakerHandle) return { role: "norole", name: `@${turn.speakerHandle}` };
   if (turn.speakerId) return { role: "norole", name: `x-id:${turn.speakerId}` };
   return { role: "norole", name: "unknown" };
@@ -97,6 +127,7 @@ export function resolveZepConfig(env = process.env) {
     disabledReason,
     apiKey,
     userId,
+    ownerName: normalizeOwnerName(env.ZEP_OWNER_NAME),
     ownerHandle: normalizeHandle(env.X_OWNER_HANDLE),
     ownerCaptionWaitMs: boundedInteger(env.ZEP_OWNER_CAPTION_WAIT_MS, 1_200, 250, 5_000),
     contextTimeoutMs: boundedInteger(
@@ -110,6 +141,12 @@ export function resolveZepConfig(env = process.env) {
       DEFAULT_CONTEXT_MAX_CHARS,
       500,
       50_000,
+    ),
+    ingestTimeoutMs: boundedInteger(
+      env.ZEP_INGEST_TIMEOUT_MS,
+      DEFAULT_INGEST_TIMEOUT_MS,
+      1_000,
+      60_000,
     ),
   };
 }
@@ -183,10 +220,10 @@ export function normalizeBrowserTurn(value) {
   };
 }
 
-export function zepMessageForTurn(turn) {
+export function zepMessageForTurn(turn, { ownerName = "Owner" } = {}) {
   if (!turn?.final || !turn.text) throw new Error("Apenas turns finalizados podem ser enviados ao Zep.");
   const turnId = clean(turn.turnId, 180) || fallbackTurnId(turn);
-  const identity = messageIdentity(turn);
+  const identity = messageIdentity(turn, ownerName);
   return {
     content: turn.text,
     createdAt: turn.timestamp,
@@ -221,6 +258,8 @@ export class ZepMemoryService {
   #userPromise;
   #threadPromises = new Map();
   #threadQueues = new Map();
+  #threadTurnIds = new Map();
+  #threadTurnIndexPromises = new Map();
   #turnPromises = new Map();
   #retrievalPromises = new Map();
   #recentFingerprints = new Map();
@@ -240,6 +279,7 @@ export class ZepMemoryService {
       ...(this.#config.disabledReason ? { reason: this.#config.disabledReason } : {}),
       contextTimeoutMs: this.#config.contextTimeoutMs,
       contextMaxChars: this.#config.contextMaxChars,
+      ingestTimeoutMs: this.#config.ingestTimeoutMs,
       ownerCaptionWaitMs: this.#config.ownerCaptionWaitMs,
     };
   }
@@ -252,7 +292,7 @@ export class ZepMemoryService {
     });
   }
 
-  async ingest(turn, { returnContext = false } = {}) {
+  async ingest(turn) {
     if (!this.#config.enabled) return { ingested: false, context: "", disabled: true };
     const normalizedTurn = { ...turn, turnId: clean(turn.turnId, 180) || fallbackTurnId(turn) };
     const threadId = zepThreadIdForSpace(normalizedTurn.spaceId);
@@ -284,10 +324,7 @@ export class ZepMemoryService {
       turnId: normalizedTurn.turnId,
       at: Date.now(),
     });
-    const promise = this.#enqueue(threadId, () => this.#ingestOnce(normalizedTurn, {
-      returnContext,
-      threadId,
-    }));
+    const promise = this.#enqueue(threadId, () => this.#ingestOnce(normalizedTurn, { threadId }));
     this.#remember(this.#turnPromises, correlationId, promise);
     return promise;
   }
@@ -299,18 +336,18 @@ export class ZepMemoryService {
     if (!normalizedTurnId) throw new Error("turnId é obrigatório para correlacionar retrieval Zep.");
     const correlationId = `${threadId}:${normalizedTurnId}`;
     if (this.#retrievalPromises.has(correlationId)) return this.#retrievalPromises.get(correlationId);
-    const promise = this.#enqueue(threadId, () => this.#retrieveOnce({
+    const promise = this.#retrieveOnce({
       threadId,
       turnId: normalizedTurnId,
       spaceId,
-    }));
+    });
     this.#remember(this.#retrievalPromises, correlationId, promise);
     return promise;
   }
 
-  async #ingestOnce(turn, { returnContext, threadId }) {
+  async #ingestOnce(turn, { threadId }) {
     const startedAt = Date.now();
-    const message = zepMessageForTurn(turn);
+    const message = zepMessageForTurn(turn, { ownerName: this.#config.ownerName });
     this.#info("final_turn", {
       source: turn.source,
       spaceId: turn.spaceId,
@@ -319,32 +356,75 @@ export class ZepMemoryService {
       chars: turn.text.length,
     });
     try {
-      await this.#ensureThread(threadId, turn.spaceId);
-      const timeoutMs = returnContext ? this.#config.contextTimeoutMs : Math.max(2_000, this.#config.contextTimeoutMs);
-      const response = await this.#client.thread.addMessages(threadId, {
-        messages: [message],
-        returnContext,
-      }, {
-        abortSignal: AbortSignal.timeout(timeoutMs),
-        maxRetries: 0,
-      });
-      const rawContext = returnContext ? clean(response?.context, 100_000) : "";
-      const context = rawContext.slice(0, this.#config.contextMaxChars);
+      const thread = await this.#ensureThread(threadId, turn.spaceId);
+      const turnIds = await this.#ensureThreadTurnIndex(threadId, { created: thread.created });
+      if (turnIds.has(turn.turnId)) {
+        const latencyMs = Date.now() - startedAt;
+        this.#info("turn_deduplicated", { threadId, turnId: turn.turnId, reason: "thread_metadata" });
+        return {
+          ingested: false,
+          deduplicated: true,
+          context: "",
+          threadId,
+          turnId: turn.turnId,
+          latencyMs,
+        };
+      }
+      let response;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          response = await this.#client.thread.addMessages(threadId, {
+            messages: [message],
+            returnContext: false,
+          }, {
+            abortSignal: AbortSignal.timeout(this.#config.ingestTimeoutMs),
+            maxRetries: 0,
+          });
+          break;
+        } catch (error) {
+          if (await this.#turnExistsInThread(threadId, turn.turnId)) {
+            turnIds.add(turn.turnId);
+            const latencyMs = Date.now() - startedAt;
+            this.#info("turn_deduplicated", {
+              threadId,
+              turnId: turn.turnId,
+              reason: "write_result_uncertain",
+              attempt,
+            });
+            return {
+              ingested: false,
+              deduplicated: true,
+              context: "",
+              threadId,
+              turnId: turn.turnId,
+              latencyMs,
+            };
+          }
+          if (attempt === 3) throw error;
+          this.#warn("ingest_retry", {
+            threadId,
+            turnId: turn.turnId,
+            attempt,
+            error: safeError(error, [this.#config.apiKey]),
+          });
+        }
+      }
+      void response;
+      turnIds.add(turn.turnId);
       const latencyMs = Date.now() - startedAt;
       this.#info("ingest_ok", {
         threadId,
+        turnId: turn.turnId,
         speakerKind: turn.speakerKind,
         latencyMs,
-        context: Boolean(context),
-        contextChars: context.length,
-        contextTruncated: rawContext.length > context.length,
       });
-      return { ingested: true, context, threadId, latencyMs };
+      return { ingested: true, context: "", threadId, turnId: turn.turnId, latencyMs };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
-      const timedOut = error?.name === "AbortError" || error?.name === "TimeoutError";
+      const timedOut = isTimeoutError(error);
       this.#warn(timedOut ? "timeout_fallback" : "ingest_failed", {
         threadId,
+        turnId: turn.turnId,
         speakerKind: turn.speakerKind,
         latencyMs,
         error: safeError(error, [this.#config.apiKey]),
@@ -353,6 +433,7 @@ export class ZepMemoryService {
         ingested: false,
         context: "",
         threadId,
+        turnId: turn.turnId,
         latencyMs,
         timedOut,
         error: safeError(error, [this.#config.apiKey]),
@@ -362,12 +443,16 @@ export class ZepMemoryService {
 
   async #retrieveOnce({ threadId, turnId, spaceId }) {
     const startedAt = Date.now();
+    const abortSignal = AbortSignal.timeout(this.#config.contextTimeoutMs);
     try {
-      await this.#ensureThread(threadId, spaceId);
-      const response = await this.#client.thread.getUserContext(threadId, {}, {
-        abortSignal: AbortSignal.timeout(this.#config.contextTimeoutMs),
-        maxRetries: 0,
-      });
+      const response = await raceWithAbort(async () => {
+        await this.#ensureThread(threadId, spaceId);
+        if (abortSignal.aborted) throw abortSignal.reason;
+        return this.#client.thread.getUserContext(threadId, {}, {
+          abortSignal,
+          maxRetries: 0,
+        });
+      }, abortSignal);
       const rawContext = clean(response?.context, 100_000);
       const context = rawContext.slice(0, this.#config.contextMaxChars);
       const latencyMs = Date.now() - startedAt;
@@ -382,7 +467,7 @@ export class ZepMemoryService {
       return { ingested: false, context, threadId, turnId, latencyMs };
     } catch (error) {
       const latencyMs = Date.now() - startedAt;
-      const timedOut = error?.name === "AbortError" || error?.name === "TimeoutError";
+      const timedOut = isTimeoutError(error);
       this.#warn(timedOut ? "context_timeout_fallback" : "context_failed", {
         threadId,
         turnId,
@@ -431,14 +516,20 @@ export class ZepMemoryService {
     if (this.#userPromise) return this.#userPromise;
     this.#userPromise = (async () => {
       try {
-        await this.#client.user.get(this.#config.userId, { maxRetries: 0 });
+        const user = await this.#client.user.get(this.#config.userId, { maxRetries: 0 });
+        if (clean(user?.firstName, 180) !== this.#config.ownerName) {
+          await this.#client.user.update(this.#config.userId, {
+            firstName: this.#config.ownerName,
+          }, { maxRetries: 0 });
+          this.#info("user_owner_name_updated", { userId: this.#config.userId });
+        }
         this.#info("user_ready", { userId: this.#config.userId, created: false });
       } catch (error) {
         if (errorStatus(error) !== 404) throw error;
         try {
           await this.#client.user.add({
             userId: this.#config.userId,
-            firstName: "Mira",
+            firstName: this.#config.ownerName,
             metadata: { application: "mira", source: "x_spaces" },
           }, { maxRetries: 0 });
           this.#info("user_ready", { userId: this.#config.userId, created: true });
@@ -460,14 +551,17 @@ export class ZepMemoryService {
     if (!this.#threadPromises.has(threadId)) {
       this.#threadPromises.set(threadId, (async () => {
         await this.#ensureUser();
+        let created = false;
         try {
           await this.#client.thread.create({ threadId, userId: this.#config.userId }, { maxRetries: 0 });
+          created = true;
           this.#info("thread_ready", { threadId, spaceId, created: true });
         } catch (error) {
           if (!alreadyExists(error)) throw error;
           this.#info("thread_ready", { threadId, spaceId, created: false });
         }
         this.#info("space_thread_mapping", { spaceId, threadId });
+        return { created };
       })());
     }
     try {
@@ -476,6 +570,54 @@ export class ZepMemoryService {
       this.#threadPromises.delete(threadId);
       throw error;
     }
+  }
+
+  async #ensureThreadTurnIndex(threadId, { created }) {
+    if (this.#threadTurnIds.has(threadId)) return this.#threadTurnIds.get(threadId);
+    if (created) {
+      const turnIds = new Set();
+      this.#threadTurnIds.set(threadId, turnIds);
+      return turnIds;
+    }
+    if (!this.#threadTurnIndexPromises.has(threadId)) {
+      this.#threadTurnIndexPromises.set(threadId, (async () => {
+        const turnIds = new Set();
+        const limit = 100;
+        let cursor = 1;
+        while (true) {
+          const response = await this.#client.thread.get(threadId, { limit, cursor }, {
+            abortSignal: AbortSignal.timeout(this.#config.ingestTimeoutMs),
+            maxRetries: 0,
+          });
+          const messages = Array.isArray(response?.messages) ? response.messages : [];
+          for (const item of messages) {
+            const turnId = clean(item?.metadata?.turnId, 180);
+            if (turnId) turnIds.add(turnId);
+          }
+          cursor += messages.length;
+          const totalCount = Number(response?.totalCount || 0);
+          if (!messages.length || messages.length < limit || (totalCount && cursor > totalCount)) break;
+        }
+        this.#threadTurnIds.set(threadId, turnIds);
+        return turnIds;
+      })());
+    }
+    try {
+      return await this.#threadTurnIndexPromises.get(threadId);
+    } catch (error) {
+      this.#threadTurnIndexPromises.delete(threadId);
+      throw error;
+    }
+  }
+
+  async #turnExistsInThread(threadId, turnId) {
+    const response = await this.#client.thread.get(threadId, { lastn: 100 }, {
+      abortSignal: AbortSignal.timeout(this.#config.ingestTimeoutMs),
+      maxRetries: 0,
+    });
+    return (response?.messages || []).some(
+      (item) => clean(item?.metadata?.turnId, 180) === turnId,
+    );
   }
 
   #info(event, fields) {
@@ -530,7 +672,7 @@ export class ZepTurnCoordinator {
 
   ingestX(turn) {
     this.#prune(turn.spaceId);
-    if (turn.speakerKind !== "owner") return this.#zep.ingest(turn, { returnContext: false });
+    if (turn.speakerKind !== "owner") return this.#zep.ingest(turn);
     const caption = { turnId: turn.turnId, text: turn.text, at: this.#now() };
     const recent = this.#recentCaptions.get(turn.spaceId) || [];
     recent.push(caption);
@@ -546,17 +688,17 @@ export class ZepTurnCoordinator {
         captionTurnId: turn.turnId,
         fallbackStarted: match.fallbackStarted,
       });
-      return this.#zep.ingest({ ...turn, turnId: match.turn.turnId }, { returnContext: false });
+      return this.#zep.ingest({ ...turn, turnId: match.turn.turnId });
     }
-    return this.#zep.ingest(turn, { returnContext: false });
+    return this.#zep.ingest(turn);
   }
 
-  async ingestBrowser(turn, { returnContext = false, xspace = {} } = {}) {
+  async ingestBrowser(turn, { xspace = {} } = {}) {
     const activeX = Boolean(xspace.roomId)
       && xspace.roomId === turn.spaceId
       && ["connecting", "connected"].includes(String(xspace.state || ""));
     if (turn.speakerKind !== "owner" || turn.source !== "voice" || !activeX) {
-      return this.#zep.ingest(turn, { returnContext });
+      return this.#zep.ingest(turn);
     }
     this.#prune(turn.spaceId);
     const recent = this.#recentCaptions.get(turn.spaceId) || [];
@@ -566,7 +708,13 @@ export class ZepTurnCoordinator {
         turnId: turn.turnId,
         reason: "matching_x_caption_already_received",
       });
-      return this.#zep.retrieveContext({ spaceId: turn.spaceId, turnId: turn.turnId });
+      return {
+        ingested: false,
+        deduplicated: true,
+        pendingIngest: false,
+        context: "",
+        turnId: turn.turnId,
+      };
     }
     const entry = {
       turn,
@@ -587,10 +735,15 @@ export class ZepTurnCoordinator {
         turnId: turn.turnId,
         waitMs: this.#waitMs,
       });
-      void this.#zep.ingest(turn, { returnContext: false });
+      void this.#zep.ingest(turn);
     }, this.#waitMs);
-    const context = await this.#zep.retrieveContext({ spaceId: turn.spaceId, turnId: turn.turnId });
-    return { ...context, pendingIngest: true, captionWaitMs: this.#waitMs };
+    return {
+      ingested: false,
+      context: "",
+      turnId: turn.turnId,
+      pendingIngest: true,
+      captionWaitMs: this.#waitMs,
+    };
   }
 
   #prune(spaceId) {
