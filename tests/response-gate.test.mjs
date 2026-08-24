@@ -69,7 +69,7 @@ test("o gate usa uma response textual out-of-band do próprio Realtime, sem ferr
   assert.deepEqual(event.response.output_modalities, ["text"]);
   assert.deepEqual(event.response.tools, []);
   assert.equal(event.response.tool_choice, "none");
-  assert.equal(event.response.max_output_tokens, 64);
+  assert.equal(event.response.max_output_tokens, 128);
   assert.equal(event.response.metadata.response_purpose, RESPONSE_GATE_PURPOSE);
   assert.match(RESPONSE_GATE_PROMPT, /whether Mira should speak/);
   assert.match(RESPONSE_GATE_PROMPT, /When genuinely ambiguous, prefer IGNORE/);
@@ -114,20 +114,20 @@ test("output inválido, falha e timeout fazem fail-closed para IGNORE", () => {
   failed.gate.handleResponseDone({
     ...completedResponse(failed.createResponse(), "", "incomplete"),
     status_details: { reason: "max_output_tokens" },
-    max_output_tokens: 64,
+    max_output_tokens: 128,
     usage: {
-      output_tokens: 64,
-      output_token_details: { text_tokens: 0, reasoning_tokens: 64 },
+      output_tokens: 128,
+      output_token_details: { text_tokens: 0, reasoning_tokens: 128 },
     },
   });
   assert.equal(failed.decisions[0].decision, "IGNORE");
   assert.match(failed.logs[0].error, /status incomplete/);
   assert.equal(failed.logs[0].responseStatus, "incomplete");
   assert.equal(failed.logs[0].statusReason, "max_output_tokens");
-  assert.equal(failed.logs[0].outputTokens, 64);
+  assert.equal(failed.logs[0].outputTokens, 128);
   assert.equal(failed.logs[0].outputTextTokens, 0);
-  assert.equal(failed.logs[0].reasoningTokens, 64);
-  assert.equal(failed.logs[0].maxOutputTokens, 64);
+  assert.equal(failed.logs[0].reasoningTokens, 128);
+  assert.equal(failed.logs[0].maxOutputTokens, 128);
 
   const timedOut = createHarness();
   timedOut.gate.request();

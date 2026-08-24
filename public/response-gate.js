@@ -159,7 +159,7 @@ export class MiraResponseGate {
           instructions: RESPONSE_GATE_PROMPT,
           tools: [],
           tool_choice: "none",
-          max_output_tokens: 64,
+          max_output_tokens: 128,
           metadata: {
             response_purpose: RESPONSE_GATE_PURPOSE,
             gate_id: gateId,

@@ -95,7 +95,7 @@ test("o diário JSONL mantém sequência e proveniência", () => {
       responseStatus: "completed",
       outputTokens: 6,
       outputTextTokens: 6,
-      maxOutputTokens: 64,
+      maxOutputTokens: 128,
     });
     assert.deepEqual(gate, {
       at: "2026-08-23T10:00:02.000Z",
@@ -106,7 +106,7 @@ test("o diário JSONL mantém sequência e proveniência", () => {
       responseStatus: "completed",
       outputTokens: 6,
       outputTextTokens: 6,
-      maxOutputTokens: 64,
+      maxOutputTokens: 128,
     });
     assert.deepEqual(reloaded.readResponseGates(), [gate]);
     assert.throws(() => reloaded.appendResponseGate({ decision: "MAYBE", latencyMs: 1 }));
