@@ -140,7 +140,8 @@ idempotentes. `ZEP_CONTEXT_MAX_CHARS` limita o bloco que entra no Realtime.
 O listener lê automaticamente o owner em `creator_results`/`participants.admins`
 da metadata do Space, por handle ou Twitter ID estruturado. `X_OWNER_HANDLE` é apenas
 um override para protocolos X que deixem de fornecer essa metadata. `X_SELF_HANDLE`
-identifica a conta da Mira e evita reingerir a própria fala através das captions X.
+identifica a conta da Mira e evita reingerir a própria fala através das captions X;
+nesta aplicação, o valor padrão é `mira_theagent`.
 
 Uma fala do owner pode aparecer simultaneamente na transcrição Realtime e nas
 captions X. A caption X é a fonte autoritativa. O final Realtime espera no máximo

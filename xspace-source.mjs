@@ -43,7 +43,7 @@ export function resolveXSpaceConfig(env, projectRoot) {
       || join(homedir(), ".config", "kika", "twitter.cookies"),
     python: (env.X_PYTHON || env.KIKA_X_PYTHON || "").trim()
       || firstExisting([localPython, codexVoicePython]) || "python3",
-    selfHandle: String(env.X_SELF_HANDLE || "nexo_theagent").replace(/^@/, "").toLowerCase(),
+    selfHandle: String(env.X_SELF_HANDLE || "mira_theagent").replace(/^@/, "").toLowerCase(),
     ownerHandle: String(env.X_OWNER_HANDLE || "").replace(/^@/, "").toLowerCase(),
     projectRoot,
   };
@@ -60,6 +60,12 @@ export function parseXSpaceCaption(value) {
   const chatUserId = typeof value.chatUserId === "string" ? value.chatUserId.trim().slice(0, 80) : "";
   const twitterId = typeof value.twitterId === "string" ? value.twitterId.trim().slice(0, 80) : "";
   return { eventId, handle, displayName, chatUserId, twitterId, text, receivedAtMs };
+}
+
+export function shouldForwardXSpaceCaption(caption, selfHandle = "mira_theagent") {
+  const captionHandle = String(caption?.handle || "").replace(/^@/, "").toLowerCase();
+  const normalizedSelfHandle = String(selfHandle || "").replace(/^@/, "").toLowerCase();
+  return !captionHandle || !normalizedSelfHandle || captionHandle !== normalizedSelfHandle;
 }
 
 export function buildXSpaceContext(caption) {
@@ -163,7 +169,7 @@ export class XSpaceSource extends EventEmitter {
         lastCaptionAtMs: caption.receivedAtMs,
       };
       this.emit("status", this.status);
-      if (caption.handle !== this.#config.selfHandle) {
+      if (shouldForwardXSpaceCaption(caption, this.#config.selfHandle)) {
         this.emit("caption", { ...caption, final: true, spaceId: this.#config.roomId });
       }
     } catch {
