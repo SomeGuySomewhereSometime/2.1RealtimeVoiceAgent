@@ -4,7 +4,7 @@ import { ZepClient } from "@getzep/zep-cloud";
 
 const HANDLE = /^[A-Za-z0-9_]{1,15}$/;
 const ALLOWED_BROWSER_SOURCES = new Set(["voice", "typed"]);
-const DEFAULT_CONTEXT_TIMEOUT_MS = 350;
+const DEFAULT_CONTEXT_TIMEOUT_MS = 500;
 const DEFAULT_CONTEXT_MAX_CHARS = 12_000;
 const DEFAULT_INGEST_TIMEOUT_MS = 10_000;
 
