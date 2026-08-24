@@ -15,7 +15,11 @@ browser (microfone + áudio remoto)
         │                                      voz e turn-taking
         │                              ↑
         ├── X live chat ── legenda final @handle + texto
-        │
+        │                    │
+        │                    └── turn normalizado ── Zep User Graph
+        │                                           ├── thread por Space
+        │                                           └── contexto histórico dinâmico ──┐
+        │                                                                              ↓
         └── consult_codex ── servidor Node ── codex app-server --stdio
                                                 │
                                                 ├── thread principal durável
@@ -54,8 +58,9 @@ o login nem o protocolo interno do Codex.
   relevantes e perguntas com “hoje”, “atual”, “último” ou “mais recente”;
 - mantém o microfone e a interface ativos enquanto uma consulta está pendente;
 - guarda a conversa literal em `data/conversation.jsonl`;
-- guarda decisões `RESPOND`/`IGNORE`, latência e, quando disponível, a transcrição
-  associada em `data/response-gates.jsonl`, sem guardar áudio;
+- guarda decisões `RESPOND`/`IGNORE`, latência, estado/causa terminal, consumo real
+  de tokens e, quando disponível, a transcrição associada em
+  `data/response-gates.jsonl`, sem guardar áudio;
 - guarda todos os pedidos e respostas do Luna, com duração, modelo, reasoning e
   prompt técnico, em `data/codex-consults.jsonl`;
 - executa pesquisa num fork efémero, guarda o resultado em `data/research.jsonl`
@@ -65,6 +70,13 @@ o login nem o protocolo interno do Codex.
 - recebe as legendas finais do live chat de um X Space e envia imediatamente
   `@handle + texto` ao contexto do Realtime, sem disparar uma resposta;
 - guarda essas legendas em `data/xspace-<room-id>.jsonl`, com proveniência literal.
+- envia apenas turns finalizados para o Zep Cloud: owner como `user`, Mira como
+  `assistant` e participantes externos como `norole`, sempre com identidade X
+  estruturada quando existe;
+- mantém uma thread Zep determinística por Space e um único User Graph entre Spaces;
+- recupera um Context Block antes de `RESPOND`, com timeout e fallback fail-open, e
+  substitui o bloco Realtime anterior em vez de o acumular;
+- ingere turns relevantes mesmo quando o gate decide `IGNORE`.
 
 ## Requisitos
 
@@ -74,6 +86,7 @@ o login nem o protocolo interno do Codex.
 - OpenClaw autenticado uma vez neste projeto.
 - Codex CLI autenticado pela conta usada no Codex app.
 - cookies de uma sessão X válida para ativar a integração opcional com Spaces.
+- um projeto Zep Cloud e `ZEP_API_KEY` apenas se quiser ativar memória permanente.
 
 ## Autenticar sem API key
 
@@ -94,6 +107,73 @@ codex login status
 
 Não é usada uma `OPENAI_API_KEY`: o Realtime usa o OAuth do OpenClaw e o
 app-server reutiliza o login local do Codex.
+
+## Memória permanente Zep
+
+Crie um `.env` local, que já está ignorado pelo Git:
+
+```bash
+cp .env.example .env
+```
+
+Preencha apenas localmente:
+
+```text
+ZEP_API_KEY=...
+ZEP_USER_ID=mira-main
+ZEP_OWNER_NAME=Owner
+ZEP_ENABLED=true
+ZEP_CONTEXT_TIMEOUT_MS=350
+ZEP_CONTEXT_MAX_CHARS=12000
+ZEP_INGEST_TIMEOUT_MS=10000
+ZEP_OWNER_CAPTION_WAIT_MS=1200
+```
+
+Sem chave ou sem User ID, a aplicação continua normalmente e regista uma única
+mensagem clara de memória desativada. A chave nunca é devolvida pela API local nem
+incluída nos logs. O User representa exclusivamente o owner humano, com nome
+`ZEP_OWNER_NAME` (fallback seguro `Owner`); Mira permanece o `Assistant` nativo.
+`ZEP_CONTEXT_TIMEOUT_MS` limita apenas retrieval no caminho de voz;
+`ZEP_INGEST_TIMEOUT_MS` é um orçamento separado para a escrita durável, com retries
+idempotentes. `ZEP_CONTEXT_MAX_CHARS` limita o bloco que entra no Realtime.
+
+O listener lê automaticamente o owner em `creator_results`/`participants.admins`
+da metadata do Space, por handle ou Twitter ID estruturado. `X_OWNER_HANDLE` é apenas
+um override para protocolos X que deixem de fornecer essa metadata. `X_SELF_HANDLE`
+identifica a conta da Mira e evita reingerir a própria fala através das captions X.
+
+Uma fala do owner pode aparecer simultaneamente na transcrição Realtime e nas
+captions X. A caption X é a fonte autoritativa. O final Realtime espera no máximo
+`ZEP_OWNER_CAPTION_WAIT_MS`; se a caption não chegar ou o listener falhar, é ingerido
+como fallback `User`. `turnId`, UUID determinístico, fingerprint e uma janela de
+correlação e a verificação do `turnId` já persistido na thread impedem que reconnect,
+replay, retry incerto ou uma caption tardia criem uma segunda memória. Como a API
+Zep gera o UUID final da mensagem, retries POST automáticos ficam desativados; um
+retry só acontece depois de confirmar que o `turnId` ainda não apareceu na thread.
+
+Cada turno final é escrito com `addMessages(returnContext: false)` na fila da thread.
+Retrieval usa separadamente `getUserContext` apenas depois de `RESPOND`; `IGNORE` não
+espera nem inicia retrieval. Um timeout de contexto nunca aborta nem cancela a
+ingestão, e o turno atual não depende de read-after-write do graph assíncrono.
+
+### Ontology
+
+O arranque nunca altera a ontology cloud. Para inspecionar a ontology efetiva:
+
+```bash
+npm run zep:ontology
+```
+
+O comando mostra tipos atuais, tipos esperados e diferenças. Só depois de rever o
+resultado, aplique conscientemente a definição completa orientada a debate:
+
+```bash
+npm run zep:ontology:apply
+```
+
+`setOntology` substitui os tipos customizados do alvo; por isso o script envia sempre
+a definição completa e limita a alteração ao `ZEP_USER_ID`. Os tipos default `User`
+e `Assistant` permanecem ativos.
 
 ## X Spaces: instalar e ligar
 
@@ -129,6 +209,12 @@ Abra <http://127.0.0.1:3001>, escolha uma voz e carregue em **Iniciar
 conversa**. Na primeira utilização, autorize o microfone. `PORT`, `HOST`,
 `OPENCLAW_STATE_DIR` e `OPENCLAW_AGENT_DIR` são opcionais.
 
+No dashboard Zep, abra o User definido em `ZEP_USER_ID`. Confirme uma thread
+`mira-<space>-<hash>` por Space, episódios separados por turn, mensagens `assistant`
+com nome `Mira`, externos `norole` com `@handle` e timestamps originais. No grafo,
+confirme que posições antigas permanecem históricas quando uma posição posterior as
+invalida ou substitui.
+
 ## Validar
 
 ```bash
@@ -138,7 +224,9 @@ npm run check
 Os testes verificam a fronteira HTTP local, o response gate e a sua máquina de
 estados, as escolhas fixas de
 `gpt-realtime-2.1` e `gpt-5.6-luna`/`low`, a ferramenta permitida, as vozes, o
-isolamento do token OAuth, o diário JSONL, a thread durável e o fork de pesquisa.
+isolamento do token OAuth, o diário JSONL, a thread durável, o fork de pesquisa,
+normalização/identidade Zep, roles multiparty, idempotência, ordenação por turn ID,
+fallback do owner, timeout/falha e substituição do contexto dinâmico.
 A prova final do áudio continua a ser uma chamada real, porque o acesso Realtime
 depende da conta e do backend atual.
 
@@ -151,7 +239,7 @@ reiniciar a memória deste agente. A thread principal e os turnos Codex usam
 mas não altera ficheiros nem executa ações externas em nome do utilizador.
 
 O botão **Limpar** remove apenas a transcrição visível. Não apaga o diário nem a
-thread persistente.
+thread persistente, nem o User Graph do Zep.
 
 O painel lateral **Luna → Live** mostra imediatamente quando um pedido foi
 enviado e está a aguardar. Depois apresenta o pedido, a resposta do Luna, a
@@ -166,4 +254,8 @@ persistentes, portanto continua disponível depois de reiniciar a aplicação.
   integração contra a versão local instalada;
 - a fonte X usa uma API não oficial e pode exigir ajustes se o protocolo interno
   do X mudar;
+- a correlação de duas transcrições diferentes da mesma fala usa proximidade temporal
+  e overlap textual; métricas reais de X Spaces devem orientar a afinação da janela;
+- o grafo Zep é atualizado assincronamente, portanto o Context Block do turno atual
+  serve sobretudo memória anterior e não depende de read-after-write imediato;
 - não inclui as restantes automações completas do CODEXVOICE.

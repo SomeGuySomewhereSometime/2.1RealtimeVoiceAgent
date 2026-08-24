@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,13 @@ import {
   normalizeConsultKind,
 } from "./codex-app-server.mjs";
 import { XSpaceSource, resolveXSpaceConfig } from "./xspace-source.mjs";
+import {
+  ZepMemoryService,
+  ZepTurnCoordinator,
+  normalizeBrowserTurn,
+  normalizeXSpaceTurn,
+  resolveZepConfig,
+} from "./zep-memory.mjs";
 
 export const REALTIME_MODEL = "gpt-realtime-2.1";
 export const REALTIME_VOICES = [
@@ -100,7 +108,7 @@ export function normalizeVoice(value) {
   return REALTIME_VOICES.includes(voice) ? voice : DEFAULT_VOICE;
 }
 
-export function statusPayload(oauthConfigured, codex = undefined, xspace = undefined) {
+export function statusPayload(oauthConfigured, codex = undefined, xspace = undefined, zep = undefined) {
   return {
     authentication: "openclaw-chatgpt-oauth",
     oauthConfigured: Boolean(oauthConfigured),
@@ -116,6 +124,7 @@ export function statusPayload(oauthConfigured, codex = undefined, xspace = undef
       threadReady: false,
     },
     xspace: xspace || { enabled: false, state: "disabled", captionCount: 0 },
+    zep: zep || { enabled: false, configured: true, reason: "ZEP_API_KEY ausente" },
   };
 }
 
@@ -231,6 +240,22 @@ export function createVoiceServer(options = {}) {
     config: resolveXSpaceConfig(process.env, projectRoot),
     dataDir,
   });
+  const zepConfig = options.zepConfig || resolveZepConfig(process.env);
+  const zep = options.zep || new ZepMemoryService({ config: zepConfig });
+  const zepTurns = options.zepTurns || new ZepTurnCoordinator({
+    zep,
+    ownerCaptionWaitMs: zepConfig.ownerCaptionWaitMs,
+  });
+  const onXSpaceCaption = (caption) => {
+    const turn = normalizeXSpaceTurn(caption, {
+      spaceId: caption.spaceId || xspace.status.roomId,
+      ownerHandle: zepConfig.ownerHandle || xspace.status.ownerHandle,
+      ownerTwitterId: xspace.status.ownerTwitterId,
+    });
+    if (turn) void zepTurns.ingestX(turn);
+  };
+  xspace.on("caption", onXSpaceCaption);
+  void zep.start();
   xspace.start();
 
   const server = createServer(async (req, res) => {
@@ -241,7 +266,7 @@ export function createVoiceServer(options = {}) {
         return;
       }
       if (url.pathname === "/api/status" && req.method === "GET") {
-        return send(res, 200, statusPayload(await broker.authConfigured(), codex.status(), xspace.status));
+        return send(res, 200, statusPayload(await broker.authConfigured(), codex.status(), xspace.status, zep.status));
       }
       if (url.pathname === "/api/xspace/status" && req.method === "GET") {
         return send(res, 200, xspace.status);
@@ -292,6 +317,7 @@ export function createVoiceServer(options = {}) {
           expiresAt: session.expiresAt,
           model: REALTIME_MODEL,
           voice,
+          memorySessionId: `local-${randomUUID()}`,
         });
       }
       if (url.pathname === "/api/session/cancel" && req.method === "POST") {
@@ -311,6 +337,41 @@ export function createVoiceServer(options = {}) {
         });
         return send(res, 201, { seq: row.seq });
       }
+      if (url.pathname === "/api/memory/turn" && req.method === "POST") {
+        if (!allowedOrigin(req.headers.origin, port)) return send(res, 403, { error: "Origem local recusada." });
+        const body = await readJson(req);
+        const turn = normalizeBrowserTurn(body);
+        if (!turn || !turn.turnId) return send(res, 400, { error: "Turno final de memória inválido." });
+        const result = await zepTurns.ingestBrowser(turn, {
+          xspace: xspace.status,
+        });
+        return send(res, 200, {
+          ingested: Boolean(result.ingested),
+          deduplicated: Boolean(result.deduplicated),
+          pendingIngest: Boolean(result.pendingIngest),
+          captionWaitMs: result.captionWaitMs,
+          context: result.context || "",
+          turnId: turn.turnId,
+          threadId: result.threadId,
+          latencyMs: result.latencyMs,
+          timedOut: Boolean(result.timedOut),
+        });
+      }
+      if (url.pathname === "/api/memory/context" && req.method === "POST") {
+        if (!allowedOrigin(req.headers.origin, port)) return send(res, 403, { error: "Origem local recusada." });
+        const body = await readJson(req);
+        const spaceId = typeof body.spaceId === "string" ? body.spaceId.trim().slice(0, 180) : "";
+        const turnId = typeof body.turnId === "string" ? body.turnId.trim().slice(0, 180) : "";
+        if (!spaceId || !turnId) return send(res, 400, { error: "Correlação de contexto inválida." });
+        const result = await zep.retrieveContext({ spaceId, turnId });
+        return send(res, 200, {
+          context: result.context || "",
+          turnId,
+          threadId: result.threadId,
+          latencyMs: result.latencyMs,
+          timedOut: Boolean(result.timedOut),
+        });
+      }
       if (url.pathname === "/api/response-gate" && req.method === "POST") {
         if (!allowedOrigin(req.headers.origin, port)) return send(res, 403, { error: "Origem local recusada." });
         const body = await readJson(req);
@@ -320,6 +381,13 @@ export function createVoiceServer(options = {}) {
           latencyMs: body.latencyMs,
           speaker: body.speaker,
           text: body.text,
+          responseStatus: body.responseStatus,
+          statusReason: body.statusReason,
+          outputTokens: body.outputTokens,
+          outputTextTokens: body.outputTextTokens,
+          outputAudioTokens: body.outputAudioTokens,
+          reasoningTokens: body.reasoningTokens,
+          maxOutputTokens: body.maxOutputTokens,
           error: body.error,
         });
         return send(res, 201, row);
@@ -357,10 +425,11 @@ export function createVoiceServer(options = {}) {
     }
   });
   server.on("close", () => {
+    xspace.off("caption", onXSpaceCaption);
     xspace.stop();
     void Promise.allSettled([broker.cleanup(), codex.close()]);
   });
-  return { server, host, port, broker, codex, xspace, stateDir, agentDir };
+  return { server, host, port, broker, codex, xspace, zep, stateDir, agentDir };
 }
 
 export function startVoiceServer(options = {}) {
