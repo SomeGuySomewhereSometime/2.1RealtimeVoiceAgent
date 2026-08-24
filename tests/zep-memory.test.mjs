@@ -102,6 +102,7 @@ test("a configuração é fail-open e nunca precisa de uma chave hardcoded", () 
   });
   assert.equal(enabled.enabled, true);
   assert.equal(enabled.contextTimeoutMs, 250);
+  assert.equal(resolveZepConfig({}).contextTimeoutMs, 500);
   assert.equal(enabled.ownerName, "Owner");
   assert.equal(resolveZepConfig({ ZEP_OWNER_NAME: "Mira" }).ownerName, "Owner");
 });
