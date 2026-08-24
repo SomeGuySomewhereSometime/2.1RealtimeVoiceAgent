@@ -120,17 +120,22 @@ Preencha apenas localmente:
 
 ```text
 ZEP_API_KEY=...
-ZEP_USER_ID=mira-main
+ZEP_USER_ID=owner-main
+ZEP_OWNER_NAME=Owner
 ZEP_ENABLED=true
 ZEP_CONTEXT_TIMEOUT_MS=350
 ZEP_CONTEXT_MAX_CHARS=12000
+ZEP_INGEST_TIMEOUT_MS=10000
 ZEP_OWNER_CAPTION_WAIT_MS=1200
 ```
 
 Sem chave ou sem User ID, a aplicação continua normalmente e regista uma única
 mensagem clara de memória desativada. A chave nunca é devolvida pela API local nem
-incluída nos logs. `ZEP_CONTEXT_TIMEOUT_MS` limita retrieval no caminho de voz;
-`ZEP_CONTEXT_MAX_CHARS` limita o bloco que entra no Realtime.
+incluída nos logs. O User representa exclusivamente o owner humano, com nome
+`ZEP_OWNER_NAME` (fallback seguro `Owner`); Mira permanece o `Assistant` nativo.
+`ZEP_CONTEXT_TIMEOUT_MS` limita apenas retrieval no caminho de voz;
+`ZEP_INGEST_TIMEOUT_MS` é um orçamento separado para a escrita durável, com retries
+idempotentes. `ZEP_CONTEXT_MAX_CHARS` limita o bloco que entra no Realtime.
 
 O listener lê automaticamente o owner em `creator_results`/`participants.admins`
 da metadata do Space, por handle ou Twitter ID estruturado. `X_OWNER_HANDLE` é apenas
@@ -141,8 +146,15 @@ Uma fala do owner pode aparecer simultaneamente na transcrição Realtime e nas
 captions X. A caption X é a fonte autoritativa. O final Realtime espera no máximo
 `ZEP_OWNER_CAPTION_WAIT_MS`; se a caption não chegar ou o listener falhar, é ingerido
 como fallback `User`. `turnId`, UUID determinístico, fingerprint e uma janela de
-correlação impedem que reconnect, replay ou uma caption tardia criem uma segunda
-memória.
+correlação e a verificação do `turnId` já persistido na thread impedem que reconnect,
+replay, retry incerto ou uma caption tardia criem uma segunda memória. Como a API
+Zep gera o UUID final da mensagem, retries POST automáticos ficam desativados; um
+retry só acontece depois de confirmar que o `turnId` ainda não apareceu na thread.
+
+Cada turno final é escrito com `addMessages(returnContext: false)` na fila da thread.
+Retrieval usa separadamente `getUserContext` apenas depois de `RESPOND`; `IGNORE` não
+espera nem inicia retrieval. Um timeout de contexto nunca aborta nem cancela a
+ingestão, e o turno atual não depende de read-after-write do graph assíncrono.
 
 ### Ontology
 

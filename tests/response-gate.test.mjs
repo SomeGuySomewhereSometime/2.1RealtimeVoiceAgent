@@ -189,27 +189,27 @@ test("a integração do browser separa voz, texto, XCAP, gate e tool calls", () 
   assert.match(handlerPrefix, /handleTextEvent\(event\)\) return/);
 });
 
-test("memória final permanece separada do gate e retrieval só atrasa RESPOND", () => {
+test("ingestão final é assíncrona e retrieval só existe no caminho RESPOND", () => {
   const client = readFileSync(new URL("../public/app.js", import.meta.url), "utf8");
   const finalInput = client.slice(
     client.indexOf('type === "conversation.item.input_audio_transcription.completed"'),
     client.indexOf('type === "error"', client.indexOf('type === "conversation.item.input_audio_transcription.completed"')),
   );
-  assert.match(finalInput, /rememberZepTurn/);
+  assert.match(finalInput, /void rememberZepTurn/);
   assert.match(finalInput, /finalText/);
   assert.doesNotMatch(finalInput, /event\.delta/);
+  assert.doesNotMatch(finalInput, /retrieveZepContext/);
 
   const decision = client.slice(
     client.indexOf("async function handleGateDecision"),
-    client.indexOf("function prepareZepTurn"),
+    client.indexOf("async function rememberZepTurn"),
   );
   const respond = decision.slice(decision.indexOf('result.decision === "RESPOND"'), decision.indexOf("} else {"));
   const ignore = decision.slice(decision.indexOf("} else {"));
-  assert.match(respond, /await waitForZepTurn/);
+  assert.match(respond, /await retrieveZepContext/);
   assert.match(respond, /realtimeZepContext\.replace/);
   assert.match(respond, /queuedResponse\s*=\s*true/);
-  assert.doesNotMatch(ignore, /await waitForZepTurn/);
-  assert.match(ignore, /pendingZepTurns\.delete/);
+  assert.doesNotMatch(ignore, /retrieveZepContext/);
   assert.match(decision, /result\.gateId !== latestGateId/);
 
   const memoryRequest = client.slice(
@@ -218,5 +218,14 @@ test("memória final permanece separada do gate e retrieval só atrasa RESPOND",
   );
   assert.match(memoryRequest, /final:\s*true/);
   assert.match(memoryRequest, /turnId/);
+  assert.match(memoryRequest, /\/api\/memory\/turn/);
+  assert.doesNotMatch(memoryRequest, /returnContext/);
   assert.doesNotMatch(memoryRequest, /retrieved_long_term_memory|ZEP_CONTEXT_PREAMBLE/);
+
+  const retrievalRequest = client.slice(
+    client.indexOf("async function retrieveZepContext"),
+    client.indexOf("function discoverFunctionCalls"),
+  );
+  assert.match(retrievalRequest, /\/api\/memory\/context/);
+  assert.match(retrievalRequest, /turnId:\s*key/);
 });

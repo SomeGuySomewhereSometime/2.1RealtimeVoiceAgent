@@ -11,7 +11,13 @@ if (!apiKey) throw new Error("ZEP_API_KEY is required to inspect the Zep ontolog
 if (apply && !userId) throw new Error("ZEP_USER_ID is required for an explicit user-scoped ontology update.");
 
 const client = new ZepClient({ apiKey });
-const current = await client.graph.listEntityTypes(userId ? { userId } : {}, { maxRetries: 0 });
+let current;
+try {
+  current = await client.graph.listEntityTypes(userId ? { userId } : {}, { maxRetries: 0 });
+} catch (error) {
+  if (!userId || Number(error?.statusCode || error?.status || 0) !== 404) throw error;
+  current = { entityTypes: [], edgeTypes: [] };
+}
 const entityNames = (current.entityTypes || []).map((item) => item.name).filter(Boolean).sort();
 const edgeNames = (current.edgeTypes || []).map((item) => item.name).filter(Boolean).sort();
 const requiredEntities = Object.keys(ZEP_DEBATE_ENTITIES).sort();

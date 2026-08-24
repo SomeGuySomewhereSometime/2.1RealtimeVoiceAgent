@@ -343,7 +343,6 @@ export function createVoiceServer(options = {}) {
         const turn = normalizeBrowserTurn(body);
         if (!turn || !turn.turnId) return send(res, 400, { error: "Turno final de memória inválido." });
         const result = await zepTurns.ingestBrowser(turn, {
-          returnContext: turn.speakerKind === "owner" && body.returnContext === true,
           xspace: xspace.status,
         });
         return send(res, 200, {
@@ -353,6 +352,21 @@ export function createVoiceServer(options = {}) {
           captionWaitMs: result.captionWaitMs,
           context: result.context || "",
           turnId: turn.turnId,
+          threadId: result.threadId,
+          latencyMs: result.latencyMs,
+          timedOut: Boolean(result.timedOut),
+        });
+      }
+      if (url.pathname === "/api/memory/context" && req.method === "POST") {
+        if (!allowedOrigin(req.headers.origin, port)) return send(res, 403, { error: "Origem local recusada." });
+        const body = await readJson(req);
+        const spaceId = typeof body.spaceId === "string" ? body.spaceId.trim().slice(0, 180) : "";
+        const turnId = typeof body.turnId === "string" ? body.turnId.trim().slice(0, 180) : "";
+        if (!spaceId || !turnId) return send(res, 400, { error: "Correlação de contexto inválida." });
+        const result = await zep.retrieveContext({ spaceId, turnId });
+        return send(res, 200, {
+          context: result.context || "",
+          turnId,
           threadId: result.threadId,
           latencyMs: result.latencyMs,
           timedOut: Boolean(result.timedOut),

@@ -116,7 +116,7 @@ test("a API de memória aceita apenas finais e mantém correlação por turn ID"
         ingested: false,
         pendingIngest: true,
         captionWaitMs: 900,
-        context: "prior debate",
+        context: "",
         turnId: turn.turnId,
         threadId: "thread-http",
       };
@@ -129,16 +129,22 @@ test("a API de memória aceita apenas finais e mantém correlação por turn ID"
     zep: {
       status: { enabled: true, configured: true, contextTimeoutMs: 100 },
       async start() { return true; },
+      async retrieveContext({ spaceId, turnId }) {
+        assert.equal(spaceId, "space-http");
+        return { context: "prior debate", turnId, threadId: "thread-http", latencyMs: 12 };
+      },
     },
     zepConfig: {
       requested: true,
       enabled: true,
       apiKey: "not-logged",
-      userId: "mira",
+      userId: "owner-main",
+      ownerName: "Owner",
       ownerHandle: "",
       ownerCaptionWaitMs: 900,
       contextTimeoutMs: 100,
       contextMaxChars: 1_000,
+      ingestTimeoutMs: 1_000,
     },
     zepTurns,
     broker: { async cleanup() {}, async authConfigured() { return true; } },
@@ -176,16 +182,29 @@ test("a API de memória aceita apenas finais e mantém correlação por turn ID"
         spaceId: "space-http",
         turnId: "voice-turn-1",
         text: "Mira, what do you remember?",
-        returnContext: true,
       }),
     });
     assert.equal(final.status, 200);
     const result = await final.json();
     assert.equal(result.turnId, "voice-turn-1");
-    assert.equal(result.context, "prior debate");
+    assert.equal(result.context, "");
     assert.equal(result.pendingIngest, true);
     assert.equal(coordinatorCalls[0][1].speakerKind, "owner");
     assert.equal(coordinatorCalls[0][2].xspace.ownerHandle, "owner_auto");
+
+    const context = await fetch(`http://127.0.0.1:${address.port}/api/memory/context`, {
+      method: "POST",
+      headers: { Origin: "http://127.0.0.1:3001", "Content-Type": "application/json" },
+      body: JSON.stringify({ spaceId: "space-http", turnId: "voice-turn-1" }),
+    });
+    assert.equal(context.status, 200);
+    assert.deepEqual(await context.json(), {
+      context: "prior debate",
+      turnId: "voice-turn-1",
+      threadId: "thread-http",
+      latencyMs: 12,
+      timedOut: false,
+    });
 
     xspace.emit("caption", {
       final: true,

@@ -104,7 +104,6 @@ const activeToolCalls = new Map();
 const handledToolCalls = new Set();
 const recentFinals = new Map();
 const transientEvaluations = new Map();
-const pendingZepTurns = new Map();
 const realtimeZepContext = new RealtimeZepContext({ send: (event) => sendRealtime(event) });
 const responseGate = new MiraResponseGate({
   send: (event) => sendRealtime(event),
@@ -449,7 +448,6 @@ function handleRealtimeEvent(raw) {
   } else if (type === "input_audio_buffer.speech_stopped") {
     voiceInputActive = false;
     setState("thinking", "A perceber", "A decidir silenciosamente se a fala foi dirigida à Mira.");
-    prepareZepTurn(event.item_id);
     latestGateId = responseGate.request({ itemId: event.item_id });
   } else if (type === "response.created") {
     responseActive = true;
@@ -496,14 +494,12 @@ function handleRealtimeEvent(raw) {
     responseGate.noteTranscript({ itemId: event.item_id, text: event.transcript });
     const finalText = String(event.transcript || "").trim();
     const turnId = String(event.item_id || `voice-${crypto.randomUUID()}`);
-    const memoryPromise = rememberZepTurn({
+    void rememberZepTurn({
       role: "user",
       text: finalText,
       source: "voice",
       turnId,
-      returnContext: true,
     });
-    attachZepTurn(turnId, memoryPromise);
     updateTranscript("user", finalText, true, { turnId, memoryAlreadyStarted: true });
   } else if (type === "error" || type === "conversation.item.input_audio_transcription.failed") {
     fail(String(event.error?.message || event.error || "O Realtime devolveu um erro."));
@@ -537,7 +533,6 @@ function updateTranscript(role, text, done, { turnId = "", memoryAlreadyStarted 
         text: finalText,
         source: "voice",
         turnId: turnId || `${role}-${crypto.randomUUID()}`,
-        returnContext: false,
       });
       if (consultJobId) pendingLiveConsultId = "";
     }
@@ -572,13 +567,14 @@ async function sendText(event) {
     item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
   });
   setState("thinking", "A perceber", "A preparar uma resposta à mensagem escrita.");
-  const result = await rememberZepTurn({
+  const turnId = `typed-${crypto.randomUUID()}`;
+  void rememberZepTurn({
     role: "user",
     text,
     source: "typed",
-    turnId: `typed-${crypto.randomUUID()}`,
-    returnContext: true,
+    turnId,
   });
+  const result = await retrieveZepContext(turnId);
   realtimeZepContext.replace(result.context || "");
   queuedResponse = true;
   sendButton.disabled = false;
@@ -587,11 +583,10 @@ async function sendText(event) {
 
 async function handleGateDecision(result) {
   if (!latestGateId || result.gateId !== latestGateId) {
-    pendingZepTurns.delete(String(result.itemId || ""));
     return;
   }
   if (result.decision === "RESPOND") {
-    const memory = await waitForZepTurn(result.itemId);
+    const memory = await retrieveZepContext(result.itemId);
     if (!latestGateId || result.gateId !== latestGateId) return;
     realtimeZepContext.replace(memory.context || "");
     queuedResponse = true;
@@ -599,44 +594,13 @@ async function handleGateDecision(result) {
       ? "A fala foi dirigida à Mira; memória histórica relevante aplicada."
       : "A fala foi dirigida à Mira.");
   } else {
-    pendingZepTurns.delete(String(result.itemId || ""));
     setState("listening", "A ouvir", "A Mira mantém-se em silêncio.");
   }
   latestGateId = "";
   maybeCreateResponse();
 }
 
-function prepareZepTurn(turnId) {
-  const key = String(turnId || "");
-  if (!key || pendingZepTurns.has(key)) return;
-  let resolveTurn;
-  const promise = new Promise((resolve) => { resolveTurn = resolve; });
-  pendingZepTurns.set(key, { promise, resolve: resolveTurn });
-}
-
-function attachZepTurn(turnId, memoryPromise) {
-  const pending = pendingZepTurns.get(String(turnId || ""));
-  if (!pending) return;
-  Promise.resolve(memoryPromise).then(pending.resolve, () => pending.resolve({ context: "" }));
-}
-
-async function waitForZepTurn(turnId) {
-  const key = String(turnId || "");
-  const pending = pendingZepTurns.get(key);
-  if (!pending) return { context: "" };
-  let timer;
-  try {
-    return await Promise.race([
-      pending.promise,
-      new Promise((resolve) => { timer = setTimeout(() => resolve({ context: "", timedOut: true }), zepContextWaitMs); }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-    pendingZepTurns.delete(key);
-  }
-}
-
-async function rememberZepTurn({ role, text, source, turnId, returnContext }) {
+async function rememberZepTurn({ role, text, source, turnId }) {
   const finalText = String(text || "").trim();
   if (!finalText) return { context: "", ingested: false, turnId };
   try {
@@ -651,7 +615,6 @@ async function rememberZepTurn({ role, text, source, turnId, returnContext }) {
         spaceId: xSpaceRoomId || memorySessionId,
         turnId,
         timestamp: new Date().toISOString(),
-        returnContext: Boolean(returnContext),
       }),
     });
     const result = await response.json();
@@ -660,6 +623,32 @@ async function rememberZepTurn({ role, text, source, turnId, returnContext }) {
     return result;
   } catch {
     return { context: "", ingested: false, turnId };
+  }
+}
+
+async function retrieveZepContext(turnId) {
+  const key = String(turnId || "");
+  if (!key) return { context: "", turnId: key };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), zepContextWaitMs);
+  try {
+    const response = await fetch("/api/memory/context", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        spaceId: xSpaceRoomId || memorySessionId,
+        turnId: key,
+      }),
+      signal: controller.signal,
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Zep context request failed");
+    if (result.turnId !== key) return { context: "", turnId: key, correlationMismatch: true };
+    return result;
+  } catch {
+    return { context: "", turnId: key };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -972,7 +961,6 @@ function disconnect(showIdle) {
   transientEvaluations.clear();
   pendingLiveConsultId = "";
   memorySessionId = "";
-  pendingZepTurns.clear();
   realtimeZepContext.reset();
   handledToolCalls.clear();
   toolDrafts.clear();
